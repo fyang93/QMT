@@ -2,7 +2,7 @@
 import json
 import locale
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from queue import Empty, Queue
 from threading import Event, Lock, Thread
 from time import monotonic
@@ -21,6 +21,7 @@ PORT = 10086
 BACKFILL_PERIOD_DAYS = {"1d": 60, "5m": 60}
 INCREMENTAL_INTERVAL_SECONDS = 300
 _QMT_FIELDS = ("open", "high", "low", "close", "volume", "amount")
+_QMT_TIMEZONE = timezone(timedelta(hours=8))
 
 
 # ===================================
@@ -89,7 +90,7 @@ def to_jsonable(value):
 
 
 def backfill_range(period, start_time="", end_time=""):
-    now = datetime.now()
+    now = datetime.now(_QMT_TIMEZONE)
     days = BACKFILL_PERIOD_DAYS.get(period)
     if days is None:
         raise ValueError("background backfill only supports 1d and 5m")
@@ -155,7 +156,7 @@ def _broadcast(payload, history=False, factors=False):
 
 def _announce_history(stocks, period, start_time, end_time, incremental):
     global _HISTORY_SEQUENCE
-    today = datetime.now().strftime("%Y%m%d")
+    today = datetime.now(_QMT_TIMEZONE).strftime("%Y%m%d")
     factor_batch = {}
     for stock in stocks:
         factor_key = stock + ":" + today
@@ -229,7 +230,7 @@ def set_backfill_targets(stocks, refresh=False):
 
 def schedule_incremental_backfill():
     global _BACKFILL_NEXT_INCREMENTAL
-    now = datetime.now()
+    now = datetime.now(_QMT_TIMEZONE)
     if now.weekday() >= 5 or not "0915" <= now.strftime("%H%M") <= "1510":
         return
     with _BACKFILL_LOCK:
