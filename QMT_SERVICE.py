@@ -43,6 +43,7 @@ _BACKFILL_LOCK = Lock()
 _BACKFILL_STOP = Event()
 _BACKFILL_THREAD = None
 _BACKFILL_NEXT_INCREMENTAL = 0.0
+_BACKFILL_LAST_INCREMENTAL_DATE = ""
 _UNIVERSE_STATUS = {}
 _BACKFILL_FACTOR_SENT = set()
 _HISTORY_DOWNLOAD_BATCH_SIZE = 300
@@ -229,18 +230,28 @@ def set_backfill_targets(stocks, refresh=False):
 
 
 def schedule_incremental_backfill():
-    global _BACKFILL_NEXT_INCREMENTAL
+    global _BACKFILL_NEXT_INCREMENTAL, _BACKFILL_LAST_INCREMENTAL_DATE
     now = datetime.now(_QMT_TIMEZONE)
-    if now.weekday() >= 5 or not "0915" <= now.strftime("%H%M") <= "1510":
+    today = now.strftime("%Y%m%d")
+    # ponytail: the close-time repair covers missed bars without competing with live subscriptions.
+    if now.weekday() >= 5 or now.strftime("%H%M") < "1510":
         return
     with _BACKFILL_LOCK:
-        if _BACKFILL_PENDING or _BACKFILL_RUNNING or monotonic() < _BACKFILL_NEXT_INCREMENTAL:
+        if _BACKFILL_LAST_INCREMENTAL_DATE == today or _BACKFILL_PENDING or _BACKFILL_RUNNING or monotonic() < _BACKFILL_NEXT_INCREMENTAL:
             return
-        for stock in sorted(_UNIVERSE_STATUS):
-            for period in BACKFILL_PERIOD_DAYS:
-                item = (stock, period)
-                _BACKFILL_PENDING.add(item)
-                _BACKFILL_QUEUE.put(item)
+        missing = [
+            (stock, period)
+            for stock in sorted(_UNIVERSE_STATUS)
+            for period in BACKFILL_PERIOD_DAYS
+            if (_BACKFILL_RESULTS.get(stock + ":" + period) or {}).get("status") != "success"
+            or (_BACKFILL_RESULTS.get(stock + ":" + period) or {}).get("trade_date") != today
+        ]
+        if not missing:
+            _BACKFILL_LAST_INCREMENTAL_DATE = today
+            return
+        for item in missing:
+            _BACKFILL_PENDING.add(item)
+            _BACKFILL_QUEUE.put(item)
         _BACKFILL_NEXT_INCREMENTAL = monotonic() + INCREMENTAL_INTERVAL_SECONDS
         queued = len(_BACKFILL_PENDING)
     if queued:
@@ -260,12 +271,17 @@ def backfill_worker():
             if stock not in _UNIVERSE_STATUS or item not in _BACKFILL_PENDING:
                 _BACKFILL_QUEUE.task_done()
                 continue
-            batch = [item]
+            # ponytail: complete the small daily repair queue before the 5m archive monopolizes QMT history reads.
+            daily = next((candidate for candidate in _BACKFILL_PENDING if candidate[1] == "1d"), None)
+            if period != "1d" and daily:
+                _BACKFILL_QUEUE.put(item)
+                stock, period = daily
+            batch = [(stock, period)]
             for candidate in sorted(
                 _BACKFILL_PENDING,
                 key=lambda value: (_UNIVERSE_STATUS.get(value[0]) not in {"active", "exit_pending"}, value[0]),
             ):
-                if candidate != item and candidate[1] == period:
+                if candidate != (stock, period) and candidate[1] == period:
                     batch.append(candidate)
                     if len(batch) >= _HISTORY_DOWNLOAD_BATCH_SIZE:
                         break
@@ -285,7 +301,7 @@ def backfill_worker():
             else:
                 download_history_range(stocks, period, start_time, end_time)
             _announce_history(stocks, period, start_time, end_time, incremental)
-            result = {"status": "success", "period": period, "mode": "incremental" if incremental else "bounded_incremental", "bars": None}
+            result = {"status": "success", "period": period, "trade_date": datetime.now(_QMT_TIMEZONE).strftime("%Y%m%d"), "mode": "incremental" if incremental else "bounded_incremental", "bars": None}
             logger.info("QMT history backfill complete: %s symbols=%s mode=%s", period, len(stocks), result["mode"])
             results = {stock + ":" + period: result for stock in stocks}
         except Exception as e:
