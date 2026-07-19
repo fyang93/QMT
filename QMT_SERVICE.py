@@ -18,7 +18,7 @@ TOKEN = "YOUR_QMT_HTTP_TOKEN"
 PORT = 10086
 
 # 明确时间范围可修复本地缓存缺口；不要用空 start_time 触发“从最后一条开始”的隐式增量下载。
-BACKFILL_PERIOD_DAYS = {"1d": 60, "5m": 60}
+BACKFILL_PERIOD_DAYS = {"1d": 60, "5m": 180}
 INCREMENTAL_INTERVAL_SECONDS = 300
 _QMT_FIELDS = ("open", "high", "low", "close", "volume", "amount")
 _QMT_TIMEZONE = timezone(timedelta(hours=8))
