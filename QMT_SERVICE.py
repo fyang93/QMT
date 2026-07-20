@@ -216,7 +216,7 @@ def set_universe_targets(rows, refresh=False):
         _UNIVERSE_STATUS.clear()
         _UNIVERSE_STATUS.update(desired)
         added = set(desired) if refresh else set(desired) - previous
-        for stock in sorted(added, key=lambda symbol: (desired[symbol] not in {"observing", "active", "exit_pending"}, symbol)):
+        for stock in sorted(added, key=lambda symbol: (desired[symbol] not in {"active", "exit_pending"}, symbol)):
             for period in BACKFILL_PERIOD_DAYS:
                 item = (stock, period)
                 if item not in _BACKFILL_PENDING and item != _BACKFILL_RUNNING:
@@ -279,7 +279,7 @@ def backfill_worker():
             batch = [(stock, period)]
             for candidate in sorted(
                 _BACKFILL_PENDING,
-                key=lambda value: (_UNIVERSE_STATUS.get(value[0]) not in {"observing", "active", "exit_pending"}, value[0]),
+                key=lambda value: (_UNIVERSE_STATUS.get(value[0]) not in {"active", "exit_pending"}, value[0]),
             ):
                 if candidate != (stock, period) and candidate[1] == period:
                     batch.append(candidate)
@@ -508,14 +508,14 @@ class MarketWebSocketHandler(WebSocketHandler):
         )
         logger.info(
             "QMT universe configured: symbols=%s realtime=%s backfill_tasks=%s",
-            len(self.universe), sum(status in {"observing", "active", "exit_pending"} for status in self.universe.values()), queued,
+            len(self.universe), sum(status in {"active", "exit_pending"} for status in self.universe.values()), queued,
         )
         self.refresh_subscriptions()
         self.send_json({
             "type": "configured",
             "symbols": len(self.universe),
             "queued": queued,
-            "realtime": sum(status in {"observing", "active", "exit_pending"} for status in self.universe.values()),
+            "realtime": sum(status in {"active", "exit_pending"} for status in self.universe.values()),
         })
         with _BACKFILL_LOCK:
             manifests = list(_HISTORY_MANIFESTS)
@@ -531,7 +531,7 @@ class MarketWebSocketHandler(WebSocketHandler):
     def refresh_subscriptions(self):
         desired = {
             symbol for symbol, status in self.universe.items()
-            if status in {"observing", "active", "exit_pending"}
+            if status in {"active", "exit_pending"}
         }
         current = {item.get("stock_code") for item in self.subscriptions.values()}
         for key, item in list(self.subscriptions.items()):
