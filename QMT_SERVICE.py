@@ -18,7 +18,8 @@ TOKEN = "YOUR_QMT_HTTP_TOKEN"
 PORT = 10086
 
 # 明确时间范围可修复本地缓存缺口；不要用空 start_time 触发“从最后一条开始”的隐式增量下载。
-BACKFILL_PERIOD_DAYS = {"1d": 60, "5m": 180}
+BACKFILL_PERIOD_DAYS = {"1d": 60, "5m": 180, "1m": 10}
+_BACKGROUND_BACKFILL_PERIODS = ("1d", "5m")
 INCREMENTAL_INTERVAL_SECONDS = 300
 _QMT_FIELDS = ("open", "high", "low", "close", "volume", "amount")
 _QMT_TIMEZONE = timezone(timedelta(hours=8))
@@ -94,7 +95,7 @@ def backfill_range(period, start_time="", end_time=""):
     now = datetime.now(_QMT_TIMEZONE)
     days = BACKFILL_PERIOD_DAYS.get(period)
     if days is None:
-        raise ValueError("background backfill only supports 1d and 5m")
+        raise ValueError("background backfill only supports 1d, 5m, and 1m")
     return (
         start_time or (now - timedelta(days=days)).strftime("%Y%m%d%H%M%S"),
         end_time or now.strftime("%Y%m%d%H%M%S"),
@@ -211,18 +212,22 @@ def set_universe_targets(rows, refresh=False):
         symbol = str(symbol).upper().strip()
         if symbol:
             desired[symbol] = str(status).lower().strip() or "inactive"
+    queued = 0
     with _BACKFILL_LOCK:
-        previous = set(_UNIVERSE_STATUS)
+        previous = dict(_UNIVERSE_STATUS)
         _UNIVERSE_STATUS.clear()
         _UNIVERSE_STATUS.update(desired)
-        added = set(desired) if refresh else set(desired) - previous
-        for stock in sorted(added, key=lambda symbol: (desired[symbol] not in {"active", "exit_pending"}, symbol)):
-            for period in BACKFILL_PERIOD_DAYS:
+        added = set(desired) if refresh else set(desired) - set(previous)
+        promoted = {stock for stock, status in desired.items() if status in {"active", "exit_pending"} and previous.get(stock) not in {"active", "exit_pending"}}
+        for stock in sorted(added | promoted, key=lambda symbol: (desired[symbol] not in {"active", "exit_pending"}, symbol)):
+            periods = (_BACKGROUND_BACKFILL_PERIODS if stock in added else ()) + (("1m",) if desired[stock] in {"active", "exit_pending"} else ())
+            for period in periods:
                 item = (stock, period)
                 if item not in _BACKFILL_PENDING and item != _BACKFILL_RUNNING:
                     _BACKFILL_PENDING.add(item)
                     _BACKFILL_QUEUE.put(item)
-    return len(added) * len(BACKFILL_PERIOD_DAYS)
+                    queued += 1
+    return queued
 
 
 def set_backfill_targets(stocks, refresh=False):
@@ -242,7 +247,7 @@ def schedule_incremental_backfill():
         missing = [
             (stock, period)
             for stock in sorted(_UNIVERSE_STATUS)
-            for period in BACKFILL_PERIOD_DAYS
+            for period in _BACKGROUND_BACKFILL_PERIODS + (("1m",) if _UNIVERSE_STATUS[stock] in {"active", "exit_pending"} else ())
             if (_BACKFILL_RESULTS.get(stock + ":" + period) or {}).get("status") != "success"
             or (_BACKFILL_RESULTS.get(stock + ":" + period) or {}).get("trade_date") != today
         ]
@@ -268,14 +273,15 @@ def backfill_worker():
             continue
         stock, period = item
         with _BACKFILL_LOCK:
-            if stock not in _UNIVERSE_STATUS or item not in _BACKFILL_PENDING:
+            if stock not in _UNIVERSE_STATUS or item not in _BACKFILL_PENDING or (period == "1m" and _UNIVERSE_STATUS[stock] not in {"active", "exit_pending"}):
+                _BACKFILL_PENDING.discard(item)
                 _BACKFILL_QUEUE.task_done()
                 continue
-            # ponytail: complete the small daily repair queue before the 5m archive monopolizes QMT history reads.
-            daily = next((candidate for candidate in _BACKFILL_PENDING if candidate[1] == "1d"), None)
-            if period != "1d" and daily:
+            # ponytail: warm daily and active 1m data before the full-universe 5m archive.
+            priority = min(_BACKFILL_PENDING, key=lambda candidate: ({"1d": 0, "1m": 1, "5m": 2}[candidate[1]], candidate[0]))
+            if item != priority:
                 _BACKFILL_QUEUE.put(item)
-                stock, period = daily
+                stock, period = priority
             batch = [(stock, period)]
             for candidate in sorted(
                 _BACKFILL_PENDING,
