@@ -96,9 +96,11 @@ def backfill_range(period, start_time="", end_time=""):
     days = BACKFILL_PERIOD_DAYS.get(period)
     if days is None:
         raise ValueError("background backfill only supports 1d, 5m, and 1m")
+    today = now.strftime("%Y%m%d")
+    session_close = today + "150000"
     return (
         start_time or (now - timedelta(days=days)).strftime("%Y%m%d%H%M%S"),
-        end_time or now.strftime("%Y%m%d%H%M%S"),
+        end_time or min(now.strftime("%Y%m%d%H%M%S"), session_close),
     )
 
 
@@ -330,8 +332,18 @@ def start_backfill_worker(ctx):
 
 
 def account_status_payload():
+    try:
+        position_rows = get_trade_detail_data(ACCOUNT_ID, "stock", "position", "qmt")
+    except Exception:
+        logger.exception("QMT position query failed")
+        return {"account": ACCOUNT_ID, "account_type": "stock", "positions": [], "positions_complete": False}
+    if position_rows is None:
+        logger.error("QMT position query returned no result")
+        return {"account": ACCOUNT_ID, "account_type": "stock", "positions": [], "positions_complete": False}
+
     positions = []
-    for position in safe_call(get_trade_detail_data, ACCOUNT_ID, "stock", "position", "qmt") or []:
+    positions_complete = True
+    for position in position_rows:
         try:
             symbol = position.m_strInstrumentID + "." + position.m_strExchangeID
             positions.append({
@@ -345,6 +357,7 @@ def account_status_payload():
                 "YesterdayVolume": position.m_nYesterdayVolume,
             })
         except Exception:
+            positions_complete = False
             logger.exception("QMT position serialization failed")
     account_rows = safe_call(get_trade_detail_data, ACCOUNT_ID, "stock", "account", "qmt") or []
     account = account_rows[0] if account_rows else None
@@ -356,6 +369,7 @@ def account_status_payload():
         "total_money": float(account.m_dBalance),
         "available_money": float(account.m_dAvailable),
         "positions": positions,
+        "positions_complete": positions_complete,
     }
 
 
