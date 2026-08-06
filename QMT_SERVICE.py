@@ -1403,7 +1403,8 @@ class PassorderHandler(BaseHandler):
             price = float(data['price'])
             volume = int(data['volume'])
             quickTrade = int(data.get('quickTrade', 2))
-            order_ref = passorder(opType, orderType, self.acc(), stock, pr_type, price, volume, 'qmt', quickTrade, self.ctx())
+            user_order_id = str(data.get('userOrderId', '')).strip()
+            order_ref = passorder(opType, orderType, self.acc(), stock, pr_type, price, volume, 'qmt', quickTrade, user_order_id, self.ctx())
             self.write(json.dumps({
                 "status": "success",
                 "opType": opType,
@@ -1710,6 +1711,26 @@ class CanCancelOrderHandler(BaseHandler):
         accountType = data.get('accountType', 'stock')
         ret = safe_call(can_cancel_order, orderId, self.acc(), accountType)
         self.write(json.dumps({"orderId": orderId, "can_cancel": ret}, ensure_ascii=False))
+
+
+class CancelOrderHandler(BaseHandler):
+    def post(self):
+        data = self.json_body()
+        order_id = str(data.get('orderId', '')).strip()
+        account_type = data.get('accountType', 'stock')
+        if not order_id:
+            raise HTTPError(400, "必须提供 orderId")
+        try:
+            if not can_cancel_order(order_id, self.acc(), account_type):
+                raise HTTPError(409, "委托当前不可撤销")
+            if not cancel(order_id, self.acc(), account_type, self.ctx()):
+                raise HTTPError(409, "QMT 未接受撤单请求")
+            self.write(json.dumps({"status": "success", "order_id": order_id}, ensure_ascii=False))
+        except HTTPError:
+            raise
+        except Exception as e:
+            logger.exception("按委托号撤单异常")
+            raise HTTPError(500, f"撤单失败: {str(e)}")
 
 # get_debt_contract() - 获取两融负债合约明细
 class DebtContractHandler(BaseHandler):
@@ -2157,6 +2178,7 @@ def make_app():
         (r"/api/trade/value_by_order_id", ValueByOrderIdHandler),
         (r"/api/trade/last_order_id", LastOrderIdHandler),
         (r"/api/trade/can_cancel_order", CanCancelOrderHandler),
+        (r"/api/trade/cancel_order", CancelOrderHandler),
         (r"/api/trade/debt_contract", DebtContractHandler),
         (r"/api/trade/assure_contract", AssureContractHandler),
         (r"/api/trade/enable_short_contract", EnableShortContractHandler),
