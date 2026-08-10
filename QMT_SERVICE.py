@@ -1,7 +1,9 @@
 # -*- coding: gbk -*-
 import json
 import locale
+import os
 import re
+from urllib.parse import urlsplit
 from datetime import datetime, timedelta, timezone
 from queue import Empty, Queue
 from threading import Event, Lock, Thread
@@ -9,13 +11,22 @@ from time import monotonic
 from tornado.web import Application, RequestHandler, HTTPError
 from tornado.ioloop import IOLoop, PeriodicCallback
 from tornado.httpserver import HTTPServer
-from tornado.websocket import WebSocketHandler
+from tornado.httpclient import AsyncHTTPClient, HTTPClientError, HTTPRequest
+from tornado.websocket import WebSocketHandler, websocket_connect
 import logging
 
 # 自定义
 ACCOUNT_ID = "YOUR_QMT_ACCOUNT_ID"
 TOKEN = "YOUR_QMT_HTTP_TOKEN"
-PORT = 10086
+# Start this same script three times: gateway, market, and trade. The two
+# bridges bind only to loopback; gateway is the sole public listener. "all"
+# remains only as an explicit migration mode.
+SERVICE_ROLE = os.environ.get("QMT_SERVICE_ROLE", "all").strip().lower()
+_DEFAULT_PORTS = {"gateway": "10086", "market": "10087", "trade": "10088", "all": "10086"}
+PORT = int(os.environ.get("QMT_SERVICE_PORT", _DEFAULT_PORTS.get(SERVICE_ROLE, "10086")))
+BIND_HOST = os.environ.get("QMT_SERVICE_HOST", "0.0.0.0" if SERVICE_ROLE == "gateway" else "127.0.0.1")
+if SERVICE_ROLE not in {"gateway", "market", "trade", "all"}:
+    raise ValueError("QMT_SERVICE_ROLE must be gateway, market, trade, or all")
 
 # 明确时间范围可修复本地缓存缺口；不要用空 start_time 触发“从最后一条开始”的隐式增量下载。
 BACKFILL_PERIOD_DAYS = {"1d": 180, "5m": 180, "1m": 10}
@@ -2062,8 +2073,20 @@ class DealHandler(BaseHandler):
 
 
 # ============= 路由注册 =============
+def _routes_for_role(routes):
+    """Keep QMT API calls in separate QMT model processes by service role."""
+    if SERVICE_ROLE == "all":
+        return routes
+    if SERVICE_ROLE == "gateway":
+        return []
+    market_prefixes = (r"/ws", r"/api/data/", r"/api/check/", r"/api/context/", r"/api/ext/")
+    trade_prefixes = (r"/api/trade/", r"/api/holding", r"/api/money/", r"/api/order/", r"/api/sys/")
+    prefixes = market_prefixes if SERVICE_ROLE == "market" else trade_prefixes
+    return [route for route in routes if route[0].startswith(prefixes)]
+
+
 def make_app():
-    return Application([
+    routes = [
         (r"/ws", MarketWebSocketHandler),
 
         # 原有兼容路由
@@ -2195,12 +2218,13 @@ def make_app():
         (r"/api/sys/python_version", PythonVersionHandler),
         (r"/api/sys/shutdown", ShutdownHandler),
 
-    ], debug=False, compress_response=True)
+    ]
+    return Application(_routes_for_role(routes), debug=False, compress_response=True)
 
 
 def _stop_server_on_ioloop(reason):
     global _SERVER
-    logger.info("QMT HTTP Server shutdown requested: %s; releasing port 0.0.0.0:%s", reason, PORT)
+    logger.info("QMT %s bridge shutdown requested: %s; releasing port %s:%s", SERVICE_ROLE, reason, BIND_HOST, PORT)
     for client in list(_WS_CLIENTS):
         try:
             client.close()
@@ -2253,10 +2277,11 @@ def init(ContextInfo):
 
         _APP = app
         _SERVER = HTTPServer(app)
-        _SERVER.listen(PORT, address='0.0.0.0')
-        start_backfill_worker(ContextInfo)
+        _SERVER.listen(PORT, address=BIND_HOST)
+        if SERVICE_ROLE in {"market", "all"}:
+            start_backfill_worker(ContextInfo)
         _STOPPING = False
-        logger.info(f"QMT HTTP Server 启动于 http://0.0.0.0:{PORT} (全部API已加载，模型线程运行)")
+        logger.info(f"QMT {SERVICE_ROLE} bridge started at http://{BIND_HOST}:{PORT} (model thread)")
         loop.start()
         if not _STOPPING:
             logger.error("QMT HTTP IOLoop unexpectedly stopped")
@@ -2270,6 +2295,98 @@ def init(ContextInfo):
             loop.close(all_fds=True)
         if _IOLOOP is loop:
             _IOLOOP = None
+
+
+_GATEWAY_MARKET_ORIGIN = os.environ.get("QMT_MARKET_ORIGIN", "http://127.0.0.1:10087")
+_GATEWAY_TRADE_ORIGIN = os.environ.get("QMT_TRADE_ORIGIN", "http://127.0.0.1:10088")
+_GATEWAY_MARKET_TIMEOUT = float(os.environ.get("QMT_MARKET_TIMEOUT_SECONDS", "30"))
+_GATEWAY_TRADE_TIMEOUT = float(os.environ.get("QMT_TRADE_TIMEOUT_SECONDS", "5"))
+_HOP_BY_HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"}
+
+
+def _gateway_target(path):
+    if path == "/ws" or path.startswith(("/api/data/", "/api/check/", "/api/context/", "/api/ext/")):
+        return _GATEWAY_MARKET_ORIGIN, _GATEWAY_MARKET_TIMEOUT
+    if path.startswith(("/api/trade/", "/api/holding", "/api/money/", "/api/order/", "/api/sys/")):
+        return _GATEWAY_TRADE_ORIGIN, _GATEWAY_TRADE_TIMEOUT
+    raise HTTPError(404, "unknown QMT API route")
+
+
+def _gateway_headers(headers):
+    return {key: value for key, value in headers.get_all() if key.lower() not in _HOP_BY_HOP_HEADERS | {"host", "content-length"}}
+
+
+class GatewayProxyHandler(BaseHandler):
+    async def _proxy(self):
+        origin, timeout = _gateway_target(self.request.path)
+        request = HTTPRequest(
+            origin.rstrip("/") + self.request.uri, method=self.request.method,
+            headers=_gateway_headers(self.request.headers),
+            body=self.request.body if self.request.method not in {"GET", "HEAD"} else None,
+            request_timeout=timeout, connect_timeout=min(timeout, 3), follow_redirects=False,
+        )
+        try:
+            response = await AsyncHTTPClient().fetch(request, raise_error=False)
+        except HTTPClientError as error:
+            bridge = "market" if origin == _GATEWAY_MARKET_ORIGIN else "trade"
+            raise HTTPError(503, "QMT %s bridge unavailable: %s" % (bridge, error))
+        for key, value in response.headers.get_all():
+            if key.lower() not in _HOP_BY_HOP_HEADERS | {"content-length"}:
+                self.set_header(key, value)
+        self.set_status(response.code, response.reason)
+        if response.body:
+            self.write(response.body)
+
+    get = post = put = patch = delete = options = _proxy
+
+
+class GatewayWebSocketHandler(WebSocketHandler):
+    def prepare(self):
+        if self.request.headers.get("X-Token") != TOKEN:
+            raise HTTPError(401, "authentication failed")
+
+    async def open(self):
+        origin, timeout = _gateway_target("/ws")
+        scheme = "wss" if urlsplit(origin).scheme == "https" else "ws"
+        upstream_url = scheme + "://" + urlsplit(origin).netloc + self.request.uri
+        try:
+            self.upstream = await websocket_connect(
+                HTTPRequest(upstream_url, headers=_gateway_headers(self.request.headers), request_timeout=timeout),
+                connect_timeout=min(timeout, 3),
+            )
+        except Exception:
+            self.close(code=1013, reason="QMT market bridge unavailable")
+            return
+        IOLoop.current().spawn_callback(self._relay_upstream)
+
+    async def _relay_upstream(self):
+        while getattr(self, "upstream", None) is not None:
+            message = await self.upstream.read_message()
+            if message is None:
+                self.close()
+                return
+            self.write_message(message)
+
+    def on_message(self, message):
+        if getattr(self, "upstream", None) is not None:
+            self.upstream.write_message(message)
+
+    def on_close(self):
+        upstream = getattr(self, "upstream", None)
+        if upstream is not None:
+            upstream.close()
+            self.upstream = None
+
+
+def run_gateway():
+    server = HTTPServer(Application([(r"/ws", GatewayWebSocketHandler), (r"/.*", GatewayProxyHandler)], debug=False, compress_response=True))
+    server.listen(PORT, address=BIND_HOST)
+    logger.info("QMT gateway started at http://%s:%s", BIND_HOST, PORT)
+    IOLoop.current().start()
+
+
+if __name__ == "__main__" and SERVICE_ROLE == "gateway":
+    run_gateway()
 
 
 def stop(ContextInfo):
