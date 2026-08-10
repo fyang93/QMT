@@ -1383,7 +1383,8 @@ class PassorderHandler(BaseHandler):
             price = float(data['price'])
             volume = int(data['volume'])
             quickTrade = int(data.get('quickTrade', 2))
-            order_ref = passorder(opType, orderType, self.acc(), stock, pr_type, price, volume, 'qmt', quickTrade, self.ctx())
+            remark = str(data.get('userOrderId') or 'qmt')
+            order_ref = passorder(opType, orderType, self.acc(), stock, pr_type, price, volume, remark, quickTrade, self.ctx())
             self.write(json.dumps({
                 "status": "success",
                 "opType": opType,
