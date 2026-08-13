@@ -342,13 +342,12 @@ def start_backfill_worker(ctx):
     _BACKFILL_THREAD.start()
 
 
-def _position_float_profit(position):
-    """Return a reproducible stock mark-to-cost P&L, preserving broker fields separately.
+def _position_unrealized_pnl(position):
+    """Return mark-to-holding-cost P&L for a live stock position.
 
-    QMT's m_dFloatProfit can remain non-zero after a position is closed and may
-    use a cost basis that differs from m_dOpenPrice.  The account-status API
-    exposes OpenPrice as its cost basis, so FloatProfit must use that same
-    basis instead of mixing the two QMT values.
+    QMT's m_dFloatProfit is its intraday holding P&L: it is marked to the
+    previous close, not to m_dOpenPrice. Keep it separately as DailyHoldingPnl
+    so callers never confuse a daily change with total unrealized P&L.
     """
     try:
         volume = float(position.m_nVolume)
@@ -379,16 +378,21 @@ def account_status_payload():
             if float(position.m_nVolume) <= 0:
                 continue
             symbol = position.m_strInstrumentID + "." + position.m_strExchangeID
-            calculated_float_profit = _position_float_profit(position)
+            unrealized_pnl = _position_unrealized_pnl(position)
+            daily_holding_pnl = position.m_dFloatProfit
             positions.append({
                 "StockCode": symbol,
                 "Volume": position.m_nVolume,
                 "OpenPrice": position.m_dOpenPrice,
-                # Canonical P&L is calculated from the two prices this API
-                # publishes. Keep QMT's value for diagnosis, not trading/UI.
-                "FloatProfit": calculated_float_profit if calculated_float_profit is not None else position.m_dFloatProfit,
-                "QmtFloatProfit": position.m_dFloatProfit,
-                "FloatProfitSource": "last_price_minus_open_price" if calculated_float_profit is not None else "qmt_float_profit",
+                # Compatibility field: QMT's m_dFloatProfit is daily holding
+                # P&L marked to the prior close, not total unrealized P&L.
+                "FloatProfit": daily_holding_pnl,
+                "DailyHoldingPnl": daily_holding_pnl,
+                "UnrealizedPnl": unrealized_pnl,
+                "PnlSources": {
+                    "daily_holding_pnl": "qmt_m_dFloatProfit_marked_to_prior_close",
+                    "unrealized_pnl": "last_price_minus_open_price",
+                },
                 "LastPrice": position.m_dLastPrice,
                 "MarketValue": position.m_dMarketValue,
                 "CanUseVolume": position.m_nCanUseVolume,
