@@ -382,6 +382,7 @@ def account_status_payload():
             daily_holding_pnl = position.m_dFloatProfit
             positions.append({
                 "StockCode": symbol,
+                "StockName": position.m_strInstrumentName,
                 "Volume": position.m_nVolume,
                 "OpenPrice": position.m_dOpenPrice,
                 # Compatibility field: QMT's m_dFloatProfit is daily holding
