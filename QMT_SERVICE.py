@@ -342,6 +342,25 @@ def start_backfill_worker(ctx):
     _BACKFILL_THREAD.start()
 
 
+def _position_float_profit(position):
+    """Return a reproducible stock mark-to-cost P&L, preserving broker fields separately.
+
+    QMT's m_dFloatProfit can remain non-zero after a position is closed and may
+    use a cost basis that differs from m_dOpenPrice.  The account-status API
+    exposes OpenPrice as its cost basis, so FloatProfit must use that same
+    basis instead of mixing the two QMT values.
+    """
+    try:
+        volume = float(position.m_nVolume)
+        open_price = float(position.m_dOpenPrice)
+        last_price = float(position.m_dLastPrice)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if volume <= 0 or open_price <= 0 or last_price <= 0:
+        return None
+    return (last_price - open_price) * volume
+
+
 def account_status_payload():
     try:
         position_rows = get_trade_detail_data(ACCOUNT_ID, "stock", "position", "qmt")
@@ -356,12 +375,20 @@ def account_status_payload():
     positions_complete = True
     for position in position_rows:
         try:
+            # QMT can retain zero-volume rows with stale P&L after a close.
+            if float(position.m_nVolume) <= 0:
+                continue
             symbol = position.m_strInstrumentID + "." + position.m_strExchangeID
+            calculated_float_profit = _position_float_profit(position)
             positions.append({
                 "StockCode": symbol,
                 "Volume": position.m_nVolume,
                 "OpenPrice": position.m_dOpenPrice,
-                "FloatProfit": position.m_dFloatProfit,
+                # Canonical P&L is calculated from the two prices this API
+                # publishes. Keep QMT's value for diagnosis, not trading/UI.
+                "FloatProfit": calculated_float_profit if calculated_float_profit is not None else position.m_dFloatProfit,
+                "QmtFloatProfit": position.m_dFloatProfit,
+                "FloatProfitSource": "last_price_minus_open_price" if calculated_float_profit is not None else "qmt_float_profit",
                 "LastPrice": position.m_dLastPrice,
                 "MarketValue": position.m_dMarketValue,
                 "CanUseVolume": position.m_nCanUseVolume,
