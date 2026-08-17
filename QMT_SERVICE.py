@@ -56,7 +56,7 @@ _BACKFILL_STOP = Event()
 _BACKFILL_THREAD = None
 _BACKFILL_NEXT_INCREMENTAL = 0.0
 _BACKFILL_LAST_INCREMENTAL_DATE = ""
-_UNIVERSE_STATUS = {}
+_UNIVERSE_ACTIVE = {}
 _BACKFILL_FACTOR_SENT = set()
 _HISTORY_DOWNLOAD_BATCH_SIZE = 300
 _HISTORY_MANIFESTS = []
@@ -218,22 +218,19 @@ def history_coverage(ctx, stock, period, start_time, end_time):
 def set_universe_targets(rows, refresh=False):
     desired = {}
     for row in rows if isinstance(rows, (list, tuple)) else []:
-        if isinstance(row, str):
-            symbol, status = row, "inactive"
-        else:
-            symbol, status = row.get("symbol", ""), row.get("status", "inactive")
+        symbol = row if isinstance(row, str) else row.get("symbol", "")
         symbol = str(symbol).upper().strip()
         if symbol:
-            desired[symbol] = str(status).lower().strip() or "inactive"
+            desired[symbol] = False if isinstance(row, str) else parse_bool(row.get("active"))
     queued = 0
     with _BACKFILL_LOCK:
-        previous = dict(_UNIVERSE_STATUS)
-        _UNIVERSE_STATUS.clear()
-        _UNIVERSE_STATUS.update(desired)
+        previous = dict(_UNIVERSE_ACTIVE)
+        _UNIVERSE_ACTIVE.clear()
+        _UNIVERSE_ACTIVE.update(desired)
         added = set(desired) if refresh else set(desired) - set(previous)
-        promoted = {stock for stock, status in desired.items() if status in {"active", "exit_pending"} and previous.get(stock) not in {"active", "exit_pending"}}
-        for stock in sorted(added | promoted, key=lambda symbol: (desired[symbol] not in {"active", "exit_pending"}, symbol)):
-            periods = (_BACKGROUND_BACKFILL_PERIODS if stock in added else ()) + (("1m",) if desired[stock] in {"active", "exit_pending"} else ())
+        promoted = {stock for stock, active in desired.items() if active and not previous.get(stock)}
+        for stock in sorted(added | promoted, key=lambda symbol: (not desired[symbol], symbol)):
+            periods = (_BACKGROUND_BACKFILL_PERIODS if stock in added else ()) + (("1m",) if desired[stock] else ())
             for period in periods:
                 item = (stock, period)
                 if item not in _BACKFILL_PENDING and item != _BACKFILL_RUNNING:
@@ -244,7 +241,7 @@ def set_universe_targets(rows, refresh=False):
 
 
 def set_backfill_targets(stocks, refresh=False):
-    return set_universe_targets([{"symbol": stock} for stock in parse_list(stocks)], refresh)
+    return set_universe_targets([{"symbol": stock, "active": False} for stock in parse_list(stocks)], refresh)
 
 
 def schedule_incremental_backfill():
@@ -259,8 +256,8 @@ def schedule_incremental_backfill():
             return
         missing = [
             (stock, period)
-            for stock in sorted(_UNIVERSE_STATUS)
-            for period in _BACKGROUND_BACKFILL_PERIODS + (("1m",) if _UNIVERSE_STATUS[stock] in {"active", "exit_pending"} else ())
+            for stock in sorted(_UNIVERSE_ACTIVE)
+            for period in _BACKGROUND_BACKFILL_PERIODS + (("1m",) if _UNIVERSE_ACTIVE[stock] else ())
             if (_BACKFILL_RESULTS.get(stock + ":" + period) or {}).get("status") != "success"
             or (_BACKFILL_RESULTS.get(stock + ":" + period) or {}).get("trade_date") != today
         ]
@@ -286,7 +283,7 @@ def backfill_worker():
             continue
         stock, period = item
         with _BACKFILL_LOCK:
-            if stock not in _UNIVERSE_STATUS or item not in _BACKFILL_PENDING or (period == "1m" and _UNIVERSE_STATUS[stock] not in {"active", "exit_pending"}):
+            if stock not in _UNIVERSE_ACTIVE or item not in _BACKFILL_PENDING or (period == "1m" and not _UNIVERSE_ACTIVE[stock]):
                 _BACKFILL_PENDING.discard(item)
                 _BACKFILL_QUEUE.task_done()
                 continue
@@ -298,7 +295,7 @@ def backfill_worker():
             batch = [(stock, period)]
             for candidate in sorted(
                 _BACKFILL_PENDING,
-                key=lambda value: (_UNIVERSE_STATUS.get(value[0]) not in {"active", "exit_pending"}, value[0]),
+                key=lambda value: (not _UNIVERSE_ACTIVE.get(value[0]), value[0]),
             ):
                 if candidate != (stock, period) and candidate[1] == period:
                     batch.append(candidate)
@@ -558,27 +555,27 @@ class MarketWebSocketHandler(WebSocketHandler):
     def handle_configure(self, data):
         rows = data.get("universe", data.get("symbols", []))
         if isinstance(rows, dict):
-            rows = [{"symbol": symbol, "status": status} for symbol, status in rows.items()]
+            rows = [{"symbol": symbol, "active": active} for symbol, active in rows.items()]
         self.universe = {
-            str(row.get("symbol", "")).upper().strip(): str(row.get("status", "inactive")).lower().strip()
+            str(row.get("symbol", "")).upper().strip(): parse_bool(row.get("active"))
             for row in rows if isinstance(row, dict) and str(row.get("symbol", "")).strip()
         }
         self.wants_history = True
         self.wants_factors = True
         queued = set_universe_targets(
-            [{"symbol": symbol, "status": status} for symbol, status in self.universe.items()],
+            [{"symbol": symbol, "active": active} for symbol, active in self.universe.items()],
             refresh=parse_bool(data.get("refresh_history")),
         )
         logger.info(
             "QMT universe configured: symbols=%s realtime=%s backfill_tasks=%s",
-            len(self.universe), sum(status in {"active", "exit_pending"} for status in self.universe.values()), queued,
+            len(self.universe), sum(self.universe.values()), queued,
         )
         self.refresh_subscriptions()
         self.send_json({
             "type": "configured",
             "symbols": len(self.universe),
             "queued": queued,
-            "realtime": sum(status in {"active", "exit_pending"} for status in self.universe.values()),
+            "realtime": sum(self.universe.values()),
         })
         with _BACKFILL_LOCK:
             manifests = list(_HISTORY_MANIFESTS)
@@ -592,10 +589,7 @@ class MarketWebSocketHandler(WebSocketHandler):
         self.send_json({"type": "history_acked", "id": manifest_id})
 
     def refresh_subscriptions(self):
-        desired = {
-            symbol for symbol, status in self.universe.items()
-            if status in {"active", "exit_pending"}
-        }
+        desired = {symbol for symbol, active in self.universe.items() if active}
         current = {item.get("stock_code") for item in self.subscriptions.values()}
         for key, item in list(self.subscriptions.items()):
             if item.get("stock_code") not in desired:
@@ -995,7 +989,7 @@ class BackfillStatusHandler(BaseHandler):
             if _BACKFILL_RUNNING:
                 running = {"period": _BACKFILL_RUNNING[0], "symbols": _BACKFILL_RUNNING[1]}
             payload = {
-                "targets": len(_UNIVERSE_STATUS),
+                "targets": len(_UNIVERSE_ACTIVE),
                 "pending": len(_BACKFILL_PENDING),
                 "running": running,
                 "results": dict(_BACKFILL_RESULTS),
