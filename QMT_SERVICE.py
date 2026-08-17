@@ -357,6 +357,25 @@ def _position_unrealized_pnl(position):
     return (last_price - open_price) * volume
 
 
+def held_symbols():
+    try:
+        positions = get_trade_detail_data(ACCOUNT_ID, "stock", "position", "qmt")
+    except Exception:
+        logger.exception("QMT position query failed while configuring universe")
+        return None
+    if positions is None:
+        logger.error("QMT position query returned no result while configuring universe")
+        return None
+    try:
+        return {
+            str(position.m_strInstrumentID).upper() + "." + str(position.m_strExchangeID).upper()
+            for position in positions if float(position.m_nVolume) > 0
+        }
+    except Exception:
+        logger.exception("QMT position query returned an unreadable position while configuring universe")
+        return None
+
+
 def account_status_payload():
     try:
         position_rows = get_trade_detail_data(ACCOUNT_ID, "stock", "position", "qmt")
@@ -556,10 +575,19 @@ class MarketWebSocketHandler(WebSocketHandler):
         rows = data.get("universe", data.get("symbols", []))
         if isinstance(rows, dict):
             rows = [{"symbol": symbol, "active": active} for symbol, active in rows.items()]
-        self.universe = {
+        configured = {
             str(row.get("symbol", "")).upper().strip(): parse_bool(row.get("active"))
             for row in rows if isinstance(row, dict) and str(row.get("symbol", "")).strip()
         }
+        held = held_symbols()
+        if held is None:
+            self.universe = configured
+        else:
+            self.universe = {
+                symbol: active or symbol in held for symbol, active in configured.items()
+                if active or symbol in held
+            }
+            self.universe.update({symbol: True for symbol in held if symbol not in self.universe})
         self.wants_history = True
         self.wants_factors = True
         queued = set_universe_targets(
