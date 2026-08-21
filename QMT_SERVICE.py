@@ -290,8 +290,8 @@ def backfill_worker():
                 _BACKFILL_PENDING.discard(item)
                 _BACKFILL_QUEUE.task_done()
                 continue
-            # ponytail: warm daily and active 1m data before the full-universe 5m archive.
-            priority = min(_BACKFILL_PENDING, key=lambda candidate: ({"1d": 0, "1m": 1, "5m": 2}[candidate[1]], candidate[0]))
+            # ponytail: subscribed symbols always win; period only orders work within that set.
+            priority = min(_BACKFILL_PENDING, key=lambda candidate: (_UNIVERSE_STATUS[candidate[0]] not in {"active", "exit_pending"}, {"1d": 0, "1m": 1, "5m": 2}[candidate[1]], candidate[0]))
             if item != priority:
                 _BACKFILL_QUEUE.put(item)
                 stock, period = priority
