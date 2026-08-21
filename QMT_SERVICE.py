@@ -565,6 +565,8 @@ class MarketWebSocketHandler(WebSocketHandler):
         }
         self.wants_history = True
         self.wants_factors = True
+        # Subscribe before queueing background history so new live quotes win.
+        self.refresh_subscriptions()
         queued = set_universe_targets(
             [{"symbol": symbol, "status": status} for symbol, status in self.universe.items()],
             refresh=parse_bool(data.get("refresh_history")),
@@ -573,7 +575,6 @@ class MarketWebSocketHandler(WebSocketHandler):
             "QMT universe configured: symbols=%s realtime=%s backfill_tasks=%s",
             len(self.universe), sum(status in {"active", "exit_pending"} for status in self.universe.values()), queued,
         )
-        self.refresh_subscriptions()
         self.send_json({
             "type": "configured",
             "symbols": len(self.universe),
