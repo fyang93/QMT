@@ -31,6 +31,9 @@ if SERVICE_ROLE not in {"gateway", "market", "trade", "all"}:
 # 明确时间范围可修复本地缓存缺口；不要用空 start_time 触发“从最后一条开始”的隐式增量下载。
 BACKFILL_PERIOD_DAYS = {"1d": 180, "5m": 180, "1m": 10}
 _BACKGROUND_BACKFILL_PERIODS = ("1d", "5m")
+# Active/exit-pending symbols first; among them, current-day intraday bars
+# must be repaired before retained daily history.
+_BACKFILL_PERIOD_PRIORITY = {"1m": 0, "5m": 1, "1d": 2}
 INCREMENTAL_INTERVAL_SECONDS = 300
 _QMT_FIELDS = ("open", "high", "low", "close", "volume", "amount")
 _QMT_TIMEZONE = timezone(timedelta(hours=8))
@@ -113,6 +116,12 @@ def backfill_range(period, start_time="", end_time=""):
         start_time or (now - timedelta(days=days)).strftime("%Y%m%d%H%M%S"),
         end_time or min(now.strftime("%Y%m%d%H%M%S"), session_close),
     )
+
+
+def recent_backfill_range(period):
+    now = datetime.now(_QMT_TIMEZONE)
+    today = now.strftime("%Y%m%d")
+    return today + "000000", min(now.strftime("%Y%m%d%H%M%S"), today + "150000")
 
 
 def download_history_range(stocks, period, start_time, end_time):
@@ -235,11 +244,12 @@ def set_universe_targets(rows, refresh=False):
         for stock in sorted(added | promoted, key=lambda symbol: (desired[symbol] not in {"active", "exit_pending"}, symbol)):
             periods = (_BACKGROUND_BACKFILL_PERIODS if stock in added else ()) + (("1m",) if desired[stock] in {"active", "exit_pending"} else ())
             for period in periods:
-                item = (stock, period)
-                if item not in _BACKFILL_PENDING and item != _BACKFILL_RUNNING:
-                    _BACKFILL_PENDING.add(item)
-                    _BACKFILL_QUEUE.put(item)
-                    queued += 1
+                for recent in (True, False):
+                    item = (stock, period, recent)
+                    if item not in _BACKFILL_PENDING and item != _BACKFILL_RUNNING:
+                        _BACKFILL_PENDING.add(item)
+                        _BACKFILL_QUEUE.put(item)
+                        queued += 1
     return queued
 
 
@@ -258,7 +268,7 @@ def schedule_incremental_backfill():
         if _BACKFILL_LAST_INCREMENTAL_DATE == today or _BACKFILL_PENDING or _BACKFILL_RUNNING or monotonic() < _BACKFILL_NEXT_INCREMENTAL:
             return
         missing = [
-            (stock, period)
+            (stock, period, True)
             for stock in sorted(_UNIVERSE_STATUS)
             for period in _BACKGROUND_BACKFILL_PERIODS + (("1m",) if _UNIVERSE_STATUS[stock] in {"active", "exit_pending"} else ())
             if (_BACKFILL_RESULTS.get(stock + ":" + period) or {}).get("status") != "success"
@@ -284,23 +294,28 @@ def backfill_worker():
             item = _BACKFILL_QUEUE.get(timeout=0.5)
         except Empty:
             continue
-        stock, period = item
+        stock, period, recent = item
         with _BACKFILL_LOCK:
             if stock not in _UNIVERSE_STATUS or item not in _BACKFILL_PENDING or (period == "1m" and _UNIVERSE_STATUS[stock] not in {"active", "exit_pending"}):
                 _BACKFILL_PENDING.discard(item)
                 _BACKFILL_QUEUE.task_done()
                 continue
             # ponytail: subscribed symbols always win; period only orders work within that set.
-            priority = min(_BACKFILL_PENDING, key=lambda candidate: (_UNIVERSE_STATUS[candidate[0]] not in {"active", "exit_pending"}, {"1d": 0, "1m": 1, "5m": 2}[candidate[1]], candidate[0]))
+            priority = min(_BACKFILL_PENDING, key=lambda candidate: (
+                _UNIVERSE_STATUS[candidate[0]] not in {"active", "exit_pending"},
+                not candidate[2],
+                _BACKFILL_PERIOD_PRIORITY[candidate[1]],
+                candidate[0],
+            ))
             if item != priority:
                 _BACKFILL_QUEUE.put(item)
-                stock, period = priority
-            batch = [(stock, period)]
+                stock, period, recent = priority
+            batch = [(stock, period, recent)]
             for candidate in sorted(
                 _BACKFILL_PENDING,
                 key=lambda value: (_UNIVERSE_STATUS.get(value[0]) not in {"active", "exit_pending"}, value[0]),
             ):
-                if candidate != (stock, period) and candidate[1] == period:
+                if candidate != (stock, period, recent) and candidate[1:] == (period, recent):
                     batch.append(candidate)
                     if len(batch) >= _HISTORY_DOWNLOAD_BATCH_SIZE:
                         break
@@ -309,8 +324,11 @@ def backfill_worker():
             _BACKFILL_RUNNING = (period, len(batch))
         stocks = sorted({candidate[0] for candidate in batch})
         try:
-            start_time, end_time = backfill_range(period)
-            incremental = all((_BACKFILL_RESULTS.get(stock + ":" + period) or {}).get("status") == "success" for stock in stocks)
+            start_time, end_time = recent_backfill_range(period) if recent else backfill_range(period)
+            incremental = not recent and all(
+                (_BACKFILL_RESULTS.get(stock + ":" + period) or {}).get("mode") in {"incremental", "bounded_incremental"}
+                for stock in stocks
+            )
             logger.info(
                 "QMT history backfill started: %s symbols=%s mode=%s range=%s..%s",
                 period, len(stocks), "incremental" if incremental else "bounded", start_time, end_time,
@@ -320,7 +338,7 @@ def backfill_worker():
             else:
                 download_history_range(stocks, period, start_time, end_time)
             _announce_history(stocks, period, start_time, end_time, incremental)
-            result = {"status": "success", "period": period, "trade_date": datetime.now(_QMT_TIMEZONE).strftime("%Y%m%d"), "mode": "incremental" if incremental else "bounded_incremental", "bars": None}
+            result = {"status": "success", "period": period, "trade_date": datetime.now(_QMT_TIMEZONE).strftime("%Y%m%d"), "mode": "incremental" if incremental else ("recent" if recent else "bounded_incremental"), "bars": None}
             logger.info("QMT history backfill complete: %s symbols=%s mode=%s", period, len(stocks), result["mode"])
             results = {stock + ":" + period: result for stock in stocks}
         except Exception as e:
