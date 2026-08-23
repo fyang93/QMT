@@ -2440,6 +2440,58 @@ if __name__ == "__main__" and SERVICE_ROLE == "gateway":
     run_gateway()
 
 
+def on_order_stock(order):
+    """QMT 原生自动回调：委托状态变动通知"""
+    if order is None:
+        return
+    try:
+        data = to_jsonable(order)
+        if not isinstance(data, dict):
+            attrs = {}
+            for attr in dir(order):
+                if not attr.startswith('_'):
+                    try:
+                        val = getattr(order, attr)
+                        if not callable(val):
+                            attrs[attr] = to_jsonable(val)
+                    except Exception:
+                        pass
+            data = attrs
+        sys_id = getattr(order, "m_strOrderSysID", "") or data.get("m_strOrderSysID", "")
+        status = getattr(order, "m_nOrderStatus", "") or data.get("m_nOrderStatus", "")
+        logger.info("QMT on_order_stock received: sys_id=%s status=%s", sys_id, status)
+        _queue_broadcast({"type": "order_update", "data": data})
+    except Exception as e:
+        logger.exception("QMT on_order_stock processing failed: %s", e)
+
+
+def on_order_deal(deal):
+    """QMT 原生自动回调：真实撮合成交回报"""
+    if deal is None:
+        return
+    try:
+        data = to_jsonable(deal)
+        if not isinstance(data, dict):
+            attrs = {}
+            for attr in dir(deal):
+                if not attr.startswith('_'):
+                    try:
+                        val = getattr(deal, attr)
+                        if not callable(val):
+                            attrs[attr] = to_jsonable(val)
+                    except Exception:
+                        pass
+            data = attrs
+        trade_id = getattr(deal, "m_strTradeID", "") or data.get("m_strTradeID", "")
+        order_id = getattr(deal, "m_strOrderSysID", "") or data.get("m_strOrderSysID", "")
+        price = getattr(deal, "m_dPrice", "") or data.get("m_dPrice", "")
+        volume = getattr(deal, "m_nVolume", "") or data.get("m_nVolume", "")
+        logger.info("QMT on_order_deal received: trade_id=%s order_id=%s price=%s volume=%s", trade_id, order_id, price, volume)
+        _queue_broadcast({"type": "deal_update", "data": data})
+    except Exception as e:
+        logger.exception("QMT on_order_deal processing failed: %s", e)
+
+
 def stop(ContextInfo):
     _shutdown_server("stop")
 
