@@ -2417,9 +2417,6 @@ def run_gateway():
     IOLoop.current().start()
 
 
-if __name__ == "__main__" and SERVICE_ROLE == "gateway":
-    run_gateway()
-
 
 def on_order_stock(order):
     """QMT 原生自动回调：委托状态变动通知"""
@@ -2471,6 +2468,10 @@ def on_order_deal(deal):
         _queue_broadcast({"type": "deal_update", "data": data})
     except Exception as e:
         logger.exception("QMT on_order_deal processing failed: %s", e)
+
+
+if __name__ == "__main__" and SERVICE_ROLE == "gateway":
+    run_gateway()
 
 
 def stop(ContextInfo):
