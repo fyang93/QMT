@@ -287,7 +287,7 @@ def backfill_worker():
                 _BACKFILL_PENDING.discard(item)
                 _BACKFILL_QUEUE.task_done()
                 continue
-            # ponytail: warm daily and active 1m data before the full-universe 5m archive.
+            # ponytail: warm daily and subscribed 1m data before the full-universe 5m archive.
             priority = min(_BACKFILL_PENDING, key=lambda candidate: ({"1d": 0, "1m": 1, "5m": 2}[candidate[1]], candidate[0]))
             if item != priority:
                 _BACKFILL_QUEUE.put(item)
