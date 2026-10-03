@@ -252,6 +252,8 @@ def schedule_incremental_backfill():
             for period in _BACKGROUND_BACKFILL_PERIODS + (("1m",) if _UNIVERSE_STATUS[stock] in {"active", "exit_pending"} else ())
             if (_BACKFILL_RESULTS.get(stock + ":" + period) or {}).get("status") != "success"
             or (_BACKFILL_RESULTS.get(stock + ":" + period) or {}).get("trade_date") != today
+            # A successful morning warmup is not a close-time download.
+            or (_BACKFILL_RESULTS.get(stock + ":" + period) or {}).get("download_completed_at", "") < today + "151000"
         ]
         if not missing:
             _BACKFILL_LAST_INCREMENTAL_DATE = today
@@ -304,12 +306,16 @@ def backfill_worker():
                 "QMT history backfill started: %s symbols=%s mode=%s range=%s..%s",
                 period, len(stocks), "incremental" if incremental else "bounded", start_time, end_time,
             )
-            if incremental:
+            if incremental and period == "1d":
+                # Re-download a bounded overlap, including a cached partial day.
+                start_time = (datetime.now(_QMT_TIMEZONE) - timedelta(days=7)).strftime("%Y%m%d%H%M%S")
+                download_history_range(stocks, period, start_time, end_time)
+            elif incremental:
                 download_history_incremental(stocks, period)
             else:
                 download_history_range(stocks, period, start_time, end_time)
             _announce_history(stocks, period, start_time, end_time, incremental)
-            result = {"status": "success", "period": period, "trade_date": datetime.now(_QMT_TIMEZONE).strftime("%Y%m%d"), "mode": "incremental" if incremental else "bounded_incremental", "bars": None}
+            result = {"status": "success", "period": period, "trade_date": datetime.now(_QMT_TIMEZONE).strftime("%Y%m%d"), "download_completed_at": datetime.now(_QMT_TIMEZONE).strftime("%Y%m%d%H%M%S"), "mode": "incremental" if incremental else "bounded_incremental", "bars": None}
             logger.info("QMT history backfill complete: %s symbols=%s mode=%s", period, len(stocks), result["mode"])
             results = {stock + ":" + period: result for stock in stocks}
         except Exception as e:
