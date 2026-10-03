@@ -11,4 +11,6 @@
 4. Verify the Windows bridge log shows the service is listening, then start/reload the main QMT integration. Confirm the WebSocket `configured` response has the expected `symbols` and `realtime` counts and the main process logs completed subscriptions/backfill. This schema cutover's wire format is `{"symbol":"...","subscribed":true|false}`; both endpoints must use the same revision before sending the new format.
 5. On failure, stop the new strategy and restore the saved script in the QMT editor; main-side `market/qmt` checkout does not restore a Windows deployment.
 
+Adjustment-factor synchronization cannot depend on a one-shot history broadcast: a disconnected client must be able to fetch factors independently. Deploy the HTTP failure/no-event distinction before relying on empty factor responses; older bridges return the same empty object for both cases.
+
 No Windows path, remote host or deployment API is configured in this repository, so transfer, QMT editor replacement and runtime verification remain operator actions.

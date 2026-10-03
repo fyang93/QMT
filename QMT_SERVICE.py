@@ -1060,8 +1060,13 @@ class DividFactorsHandler(BaseHandler):
     def post(self):
         data = self.json_body()
         stockcode = data.get('stockcode', '')
+        if not stockcode:
+            raise HTTPError(400, "need args stockcode")
         ret = safe_call(self.ctx().get_divid_factors, stockcode)
-        self.write(json.dumps({"stockcode": stockcode, "factors": ret or {}}, ensure_ascii=False))
+        # Never turn a failed QMT call into a successful no-event response.
+        if ret is None:
+            raise HTTPError(500, "get_divid_factors failed")
+        self.write(json.dumps({"stockcode": stockcode, "factors": to_jsonable(ret), "fetched": True}, ensure_ascii=False))
 
 # ContextInfo.get_main_contract() - 获取期货主力合约
 class MainContractHandler(BaseHandler):
