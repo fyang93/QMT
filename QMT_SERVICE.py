@@ -3,6 +3,7 @@ import json
 import locale
 import os
 import re
+from collections import deque
 from uuid import uuid4
 from datetime import datetime, timedelta, timezone
 from threading import Event, Lock, Thread
@@ -52,11 +53,17 @@ _HISTORY_SEQUENCE = 0
 _HISTORY_CLIENT_ACKS = {}
 _HISTORY_MANIFEST_LIMIT = 128
 _BRIDGE_ID = uuid4().hex
+_STARTED_AT = datetime.now(timezone.utc).isoformat()
 _UNIVERSE_CLIENTS = {}
 _REALTIME_SUBSCRIPTIONS = {}
 _REALTIME_RELEASE_AT = {}
 _REALTIME_PUSHER = None
 _ACCOUNT_PUSHER = None
+_HEALTH_SAMPLER = None
+_IOLOOP_NEXT_TICK = None
+_IOLOOP_LAG_SAMPLES = deque()
+_REALTIME_LAST_PUSH_AT = None
+_REALTIME_PUSHED_SYMBOL_COUNT = 0
 _REALTIME_LAST_5M = 0.0
 _DISCONNECT_GRACE_SECONDS = 120
 # Some QMT editors omit __file__; the compiled model filename is a fallback at startup.
@@ -331,7 +338,11 @@ def merged_universe(clients):
 
 def set_client_universe(owner, universe, connection=None, refresh=False):
     clients = dict(_UNIVERSE_CLIENTS)
-    clients[owner] = {"universe": dict(universe), "connection": connection, "expires": None}
+    clients[owner] = {
+        "universe": dict(universe), "connection": connection, "expires": None,
+        "addr": connection.request.remote_ip if connection is not None else None,
+        "expires_at": None,
+    }
     desired = merged_universe(clients)
     occupied = {stock for stock, period in _REALTIME_SUBSCRIPTIONS} | {stock for stock, enabled in desired.items() if enabled}
     if len(occupied) > _QMT_REALTIME_SYMBOL_LIMIT:
@@ -376,6 +387,7 @@ def disconnect_universe_client(owner, connection):
     if client and client["connection"] is connection:
         client["connection"] = None
         client["expires"] = monotonic() + _DISCONNECT_GRACE_SECONDS
+        client["expires_at"] = (datetime.now(timezone.utc) + timedelta(seconds=_DISCONNECT_GRACE_SECONDS)).isoformat()
 
 
 def expire_universe_clients():
@@ -417,7 +429,8 @@ def refresh_global_subscriptions(ctx):
 
 
 def push_global_market_data():
-    global _REALTIME_LAST_5M
+    global _REALTIME_LAST_5M, _REALTIME_LAST_PUSH_AT, _REALTIME_PUSHED_SYMBOL_COUNT
+    pushed = set()
     expire_universe_clients()
     ctx = _APP.ContextInfo
     refresh_global_subscriptions(ctx)
@@ -438,7 +451,12 @@ def push_global_market_data():
                 continue
             selected = {stock: bars for stock, bars in data.items() if client.universe.get(stock, False)}
             if selected:
-                client.send_json({"type": "bar", "period": period, "stocks": sorted(selected), "fields": list(_QMT_FIELDS), "count": 2, "data": selected})
+                if client.send_json({"type": "bar", "period": period, "stocks": sorted(selected), "fields": list(_QMT_FIELDS), "count": 2, "data": selected}):
+                    pushed.update(selected)
+    if pushed:
+        # These writes were queued, not acknowledged by the receiving clients.
+        _REALTIME_LAST_PUSH_AT = datetime.now(timezone.utc).isoformat()
+        _REALTIME_PUSHED_SYMBOL_COUNT = len(pushed)
 
 
 def set_backfill_targets(stocks, refresh=False, owner="http"):
@@ -838,13 +856,15 @@ class MarketWebSocketHandler(WebSocketHandler):
 
     def send_json(self, data):
         if self.ws_connection is None:
-            return
+            return False
         try:
             future = self.write_message(json.dumps(data, ensure_ascii=False, default=str))
             if future is not None:
                 future.add_done_callback(self._consume_write_result)
+            return True
         except Exception as e:
             logger.debug("websocket write skipped: %s", e)
+            return False
 
     @staticmethod
     def _consume_write_result(future):
@@ -2206,7 +2226,54 @@ class CancelByRuleHandler(BaseHandler):
             logger.exception("规则撤单异常")
             raise HTTPError(500, f"撤单失败: {str(e)}")
 
-# cancel() - 按股票+数量匹配规则撤单
+def sample_ioloop_lag():
+    global _IOLOOP_NEXT_TICK
+    now = monotonic()
+    if _IOLOOP_NEXT_TICK is not None:
+        lag_ms = max(0.0, (now - _IOLOOP_NEXT_TICK) * 1000)
+        _IOLOOP_LAG_SAMPLES.append((now, lag_ms))
+        # PeriodicCallback skips missed deadlines rather than shifting its schedule.
+        _IOLOOP_NEXT_TICK += max(1, int(now - _IOLOOP_NEXT_TICK) + 1)
+    else:
+        _IOLOOP_NEXT_TICK = now + 1
+    while _IOLOOP_LAG_SAMPLES and _IOLOOP_LAG_SAMPLES[0][0] < now - 60:
+        _IOLOOP_LAG_SAMPLES.popleft()
+
+
+class HealthHandler(BaseHandler):
+    def get(self):
+        now = monotonic()
+        clients = [
+            {"client_id": client.client_id, "addr": client.request.remote_ip,
+             "state": "connected", "expires_at": None}
+            for client in _WS_CLIENTS
+        ]
+        clients.extend(
+            {"client_id": owner, "addr": client["addr"], "state": "grace",
+             "expires_at": client["expires_at"]}
+            for owner, client in _UNIVERSE_CLIENTS.items() if client["expires"] is not None
+        )
+        with _BACKFILL_LOCK:
+            backfill = {"pending": len(_BACKFILL_PENDING), "running": len(_BACKFILL_RUNNING)}
+            universe_size = len(_UNIVERSE_SUBSCRIBED)
+        self.write(json.dumps({
+            "bridge_id": _BRIDGE_ID,
+            "started_at": _STARTED_AT,
+            "ioloop_lag_ms": {
+                "latest": _IOLOOP_LAG_SAMPLES[-1][1] if _IOLOOP_LAG_SAMPLES else None,
+                "max_60s": max((lag for sampled_at, lag in _IOLOOP_LAG_SAMPLES if sampled_at >= now - 60), default=None),
+            },
+            "realtime": {
+                "last_push_at": _REALTIME_LAST_PUSH_AT,
+                "pushed_symbol_count": _REALTIME_PUSHED_SYMBOL_COUNT,
+                "subscription_count": len(_REALTIME_SUBSCRIPTIONS),
+            },
+            "universe_size": universe_size,
+            "backfill": backfill,
+            "clients": sorted(clients, key=lambda client: (client["client_id"], client["addr"])),
+        }, ensure_ascii=False))
+
+
 # sys: Python版本信息
 class PythonVersionHandler(BaseHandler):
     def get(self):
@@ -2383,6 +2450,7 @@ def make_app():
         (r"/api/ext/get_factor_rank", GetFactorRankHandler),
 
         # 系统
+        (r"/api/sys/health", HealthHandler),
         (r"/api/sys/python_version", PythonVersionHandler),
         (r"/api/sys/shutdown", ShutdownHandler),
 
@@ -2391,7 +2459,7 @@ def make_app():
 
 def _stop_server_on_ioloop(reason):
     global _SERVER
-    for callback in (_REALTIME_PUSHER, _ACCOUNT_PUSHER):
+    for callback in (_REALTIME_PUSHER, _ACCOUNT_PUSHER, _HEALTH_SAMPLER):
         if callback is not None:
             callback.stop()
     if _APP is not None:
@@ -2429,8 +2497,12 @@ def _shutdown_server(reason="stop"):
 
 def init(ContextInfo):
     global _APP, _SERVER, _IOLOOP, _STOPPING, _REALTIME_PUSHER, _ACCOUNT_PUSHER
+    global _HEALTH_SAMPLER, _IOLOOP_NEXT_TICK
     loop = None
     try:
+        for callback in (_REALTIME_PUSHER, _ACCOUNT_PUSHER, _HEALTH_SAMPLER):
+            if callback is not None:
+                callback.stop()
         if _SERVER is not None:
             _SERVER.stop()
             _SERVER = None
@@ -2453,6 +2525,10 @@ def init(ContextInfo):
         _SERVER = HTTPServer(app)
         _SERVER.listen(PORT, address='0.0.0.0')
         start_backfill_worker()
+        _IOLOOP_LAG_SAMPLES.clear()
+        _HEALTH_SAMPLER = PeriodicCallback(sample_ioloop_lag, 1000)
+        _IOLOOP_NEXT_TICK = monotonic() + 1
+        _HEALTH_SAMPLER.start()
         _REALTIME_PUSHER = PeriodicCallback(push_global_market_data, 1000)
         _REALTIME_PUSHER.start()
         _ACCOUNT_PUSHER = PeriodicCallback(push_account_status, 60000)
@@ -2465,6 +2541,10 @@ def init(ContextInfo):
     except Exception as e:
         logger.exception(f"server start failed: {e}")
     finally:
+        for callback in (_REALTIME_PUSHER, _ACCOUNT_PUSHER, _HEALTH_SAMPLER):
+            if callback is not None:
+                callback.stop()
+        _HEALTH_SAMPLER = None
         if _SERVER is not None:
             _SERVER.stop()
             _SERVER = None

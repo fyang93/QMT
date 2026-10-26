@@ -1,5 +1,6 @@
 """Offline checks; no QMT runtime, account, network or native Tornado required."""
 import importlib.util
+import json
 import locale
 import sys
 import tempfile
@@ -49,6 +50,10 @@ class UniverseProtocolTest(unittest.TestCase):
         qmt._WS_CLIENTS.clear()
         qmt._HISTORY_SEQUENCE = 0
         qmt._REALTIME_LAST_5M = 0
+        qmt._IOLOOP_NEXT_TICK = None
+        qmt._IOLOOP_LAG_SAMPLES.clear()
+        qmt._REALTIME_LAST_PUSH_AT = None
+        qmt._REALTIME_PUSHED_SYMBOL_COUNT = 0
         qmt._BACKFILL_STOP.clear()
         qmt._BACKFILL_STATE_PATH = None
         qmt._IOLOOP = types.SimpleNamespace(add_callback=lambda function, *args: function(*args))
@@ -447,6 +452,194 @@ class UniverseProtocolTest(unittest.TestCase):
             self.assertEqual(error.exception.args[0], 409)
         self.ctx.subscribe_quote.assert_not_called()
         self.ctx.unsubscribe_quote.assert_not_called()
+
+    def health(self, now=1000):
+        handler = qmt.HealthHandler.__new__(qmt.HealthHandler)
+        handler.request = types.SimpleNamespace(headers={"X-Token": qmt.TOKEN})
+        handler.application = object()  # No ContextInfo or account access is available.
+        handler.write = Mock()
+        handler.prepare()
+        with patch.object(qmt, "monotonic", return_value=now):
+            handler.get()
+        return json.loads(handler.write.call_args.args[0])
+
+    def test_health_route_requires_header_token(self):
+        with patch.object(qmt, "Application") as app:
+            qmt.make_app()
+        self.assertIn(("/api/sys/health", qmt.HealthHandler), app.call_args.args[0])
+        handler = qmt.HealthHandler.__new__(qmt.HealthHandler)
+        for headers in ({}, {"X-Token": "wrong"}):
+            handler.request = types.SimpleNamespace(headers=headers)
+            with self.assertRaises(qmt.HTTPError) as error:
+                handler.prepare()
+            self.assertEqual(error.exception.args[0], 401)
+        self.health()  # A valid token is accepted.
+
+    def test_health_empty_and_unknown_facts_are_not_inferred(self):
+        qmt._WS_CLIENTS.clear()
+        payload = self.health()
+        self.assertEqual(payload, {
+            "bridge_id": qmt._BRIDGE_ID,
+            "started_at": qmt._STARTED_AT,
+            "ioloop_lag_ms": {"latest": None, "max_60s": None},
+            "realtime": {"last_push_at": None, "pushed_symbol_count": 0, "subscription_count": 0},
+            "universe_size": 0,
+            "backfill": {"pending": 0, "running": 0},
+            "clients": [],
+        })
+        self.assertIsNotNone(datetime.fromisoformat(payload["started_at"]).utcoffset())
+        self.assertNotIn(qmt.TOKEN, json.dumps(payload))
+
+    def test_health_lists_unconfigured_connected_and_grace_without_expiring(self):
+        self.configure(self.client, {"A.SH": True, "B.SH": False})
+        unconfigured = self.make_client("unconfigured")
+        with patch.object(qmt, "monotonic", return_value=100):
+            self.client.on_close()
+        expiry = qmt._UNIVERSE_CLIENTS["first"]["expires_at"]
+        qmt._BACKFILL_PENDING.remove(("A.SH", "1m"))
+        qmt._BACKFILL_RUNNING.add(("A.SH", "1m"))
+        before = dict(qmt._UNIVERSE_CLIENTS["first"])
+        with patch.object(qmt, "_APP", object()), patch.object(qmt, "expire_universe_clients", side_effect=AssertionError), patch.object(qmt, "refresh_global_subscriptions", side_effect=AssertionError):
+            payload = self.health(now=1000)  # Even overdue grace is only observed, never mutated.
+        self.assertEqual(payload["clients"], [
+            {"client_id": "first", "addr": "10.0.0.1", "state": "grace", "expires_at": expiry},
+            {"client_id": "unconfigured", "addr": unconfigured.request.remote_ip, "state": "connected", "expires_at": None},
+        ])
+        self.assertEqual(qmt._UNIVERSE_CLIENTS["first"], before)
+        self.assertEqual(payload["universe_size"], 2)
+        self.assertEqual(payload["realtime"]["subscription_count"], 2)  # 1m + 5m native handles.
+        self.assertEqual(payload["backfill"], {"pending": 4, "running": 1})
+        self.assertIsNotNone(datetime.fromisoformat(expiry).utcoffset())
+        self.ctx.get_market_data_ex.assert_not_called()
+
+    def test_health_reconnect_discards_old_grace_address_and_expiry(self):
+        self.configure(self.client, {"A.SH": True})
+        self.client.on_close()
+        replacement = self.make_client("first")
+        replacement.request.remote_ip = "10.0.0.9"
+        self.configure(replacement, {"A.SH": True})
+        self.assertEqual(self.health()["clients"], [
+            {"client_id": "first", "addr": "10.0.0.9", "state": "connected", "expires_at": None},
+        ])
+
+    def test_ioloop_lag_sample_uses_monotonic_and_retains_only_60_seconds(self):
+        qmt._IOLOOP_NEXT_TICK = 101
+        with patch.object(qmt, "monotonic", side_effect=[101, 104.5, 105, 165.1]):
+            qmt.sample_ioloop_lag()
+            self.assertEqual(qmt._IOLOOP_LAG_SAMPLES[-1][1], 0)
+            qmt.sample_ioloop_lag()
+            self.assertEqual(qmt._IOLOOP_LAG_SAMPLES[-1][1], 2500)
+            qmt.sample_ioloop_lag()
+            self.assertEqual(qmt._IOLOOP_LAG_SAMPLES[-1][1], 0)  # Skipped-period catch-up is not negative.
+            self.assertEqual(self.health(now=105)["ioloop_lag_ms"], {"latest": 0, "max_60s": 2500})
+            qmt.sample_ioloop_lag()
+        self.assertEqual(len(qmt._IOLOOP_LAG_SAMPLES), 1)
+        self.assertAlmostEqual(qmt._IOLOOP_LAG_SAMPLES[0][1], 59100)
+
+    def test_ioloop_lag_measures_repeated_lateness_against_scheduled_deadlines(self):
+        qmt._IOLOOP_NEXT_TICK = 101
+        with patch.object(qmt, "monotonic", side_effect=[101.5, 102.5]):
+            qmt.sample_ioloop_lag()
+            qmt.sample_ioloop_lag()
+        self.assertEqual(list(qmt._IOLOOP_LAG_SAMPLES), [(101.5, 500), (102.5, 500)])
+        self.assertEqual(qmt._IOLOOP_NEXT_TICK, 103)
+
+    def test_health_rolling_max_filters_old_samples_without_mutating_them(self):
+        qmt._IOLOOP_LAG_SAMPLES.extend([(39, 9000), (40, 500), (99, 1)])
+        self.assertEqual(self.health(now=100)["ioloop_lag_ms"], {"latest": 1, "max_60s": 500})
+        self.assertEqual(self.health(now=160)["ioloop_lag_ms"], {"latest": 1, "max_60s": None})
+        self.assertEqual(len(qmt._IOLOOP_LAG_SAMPLES), 3)
+
+    def test_realtime_push_facts_deduplicate_periods_and_overlapping_clients(self):
+        self.configure(self.client, {"A.SH": True, "B.SH": True, "C.SH": False})
+        second = self.make_client("second")
+        self.configure(second, {"B.SH": True})
+        self.client.send_json = Mock(return_value=True)
+        second.send_json = Mock(return_value=True)
+        with patch.object(qmt, "monotonic", return_value=1000):
+            qmt.push_global_market_data()
+        payload = self.health()
+        self.assertEqual(payload["realtime"]["pushed_symbol_count"], 2)
+        self.assertEqual(payload["realtime"]["subscription_count"], 4)
+        self.assertEqual(self.client.send_json.call_count, 2)
+        self.assertIsNotNone(datetime.fromisoformat(payload["realtime"]["last_push_at"]).utcoffset())
+        before = payload["realtime"]
+        self.ctx.get_market_data_ex.return_value = None
+        self.ctx.get_market_data_ex.side_effect = None
+        qmt.push_global_market_data()
+        self.assertEqual(self.health()["realtime"], before)
+
+    def test_no_realtime_push_facts_for_failed_empty_or_absent_delivery(self):
+        self.configure(self.client, {"A.SH": True})
+        self.client.send_json = Mock(return_value=False)
+        qmt.push_global_market_data()
+        self.assertIsNone(self.health()["realtime"]["last_push_at"])
+        self.assertEqual(self.health()["realtime"]["pushed_symbol_count"], 0)
+        self.client.send_json.assert_called()
+        self.client.send_json.reset_mock()
+        self.client.send_json.return_value = True
+        self.ctx.get_market_data_ex.side_effect = None
+        self.ctx.get_market_data_ex.return_value = {}
+        qmt.push_global_market_data()
+        self.client.send_json.assert_not_called()
+        self.ctx.get_market_data_ex.return_value = {"A.SH": {"close": {"example": 10}}}
+        self.client.on_close()
+        qmt.push_global_market_data()
+        self.assertIsNone(self.health()["realtime"]["last_push_at"])
+        self.assertEqual(self.health()["realtime"]["pushed_symbol_count"], 0)
+
+    def test_websocket_send_reports_only_queued_writes(self):
+        client = qmt.MarketWebSocketHandler.__new__(qmt.MarketWebSocketHandler)
+        client.ws_connection = None
+        self.assertFalse(client.send_json({"type": "bar"}))
+        client.ws_connection = object()
+        future = Mock()
+        client.write_message = Mock(return_value=future)
+        self.assertTrue(client.send_json({"type": "bar"}))
+        future.add_done_callback.assert_called_once_with(client._consume_write_result)
+        client.write_message.side_effect = RuntimeError("closed")
+        self.assertFalse(client.send_json({"type": "bar"}))
+
+    def test_health_sampler_stops_with_server(self):
+        callbacks = [Mock() for _ in range(3)]
+        with patch.object(qmt, "_REALTIME_PUSHER", callbacks[0]), patch.object(qmt, "_ACCOUNT_PUSHER", callbacks[1]), patch.object(qmt, "_HEALTH_SAMPLER", callbacks[2]), patch.object(qmt, "IOLoop") as loop:
+            qmt._stop_server_on_ioloop("test")
+        for callback in callbacks:
+            callback.stop.assert_called_once()
+        loop.current.return_value.stop.assert_called_once()
+
+    def test_health_sampler_lifecycle_on_loop_exit_start_failure_and_reinit(self):
+        for failure in (None, RuntimeError("loop failed")):
+            with self.subTest(failure=failure):
+                old_sampler = Mock()
+                callbacks = []
+
+                def periodic(function, interval):
+                    callback = Mock(function=function, interval=interval)
+                    callbacks.append(callback)
+                    return callback
+
+                with patch.object(qmt, "_IOLOOP", None), patch.object(qmt, "_SERVER", None), patch.object(qmt, "_REALTIME_PUSHER", None), patch.object(qmt, "_ACCOUNT_PUSHER", None), patch.object(qmt, "_HEALTH_SAMPLER", old_sampler), patch.object(qmt, "IOLoop") as loop, patch.object(qmt, "HTTPServer"), patch.object(qmt, "start_backfill_worker"), patch.object(qmt, "PeriodicCallback", side_effect=periodic):
+                    loop.return_value.start.side_effect = failure
+                    qmt.init(Mock())
+                    old_sampler.stop.assert_called_once()
+                    self.assertEqual(callbacks[0].function, qmt.sample_ioloop_lag)
+                    self.assertEqual(callbacks[0].interval, 1000)
+                    for callback in callbacks:
+                        callback.start.assert_called_once()
+                        callback.stop.assert_called_once()
+                    loop.return_value.close.assert_called_once_with(all_fds=True)
+                    self.assertIsNone(qmt._HEALTH_SAMPLER)
+                    self.assertIsNone(qmt._IOLOOP)
+
+    def test_health_sampler_stops_if_later_callback_start_fails(self):
+        sampler, pusher = Mock(), Mock()
+        pusher.start.side_effect = RuntimeError("callback start failed")
+        with patch.object(qmt, "_IOLOOP", None), patch.object(qmt, "_SERVER", None), patch.object(qmt, "_HEALTH_SAMPLER", None), patch.object(qmt, "_REALTIME_PUSHER", None), patch.object(qmt, "_ACCOUNT_PUSHER", None), patch.object(qmt, "IOLoop"), patch.object(qmt, "HTTPServer"), patch.object(qmt, "start_backfill_worker"), patch.object(qmt, "PeriodicCallback", side_effect=[sampler, pusher]):
+            qmt.init(Mock())
+            sampler.stop.assert_called_once()
+            pusher.stop.assert_called_once()
+            self.assertIsNone(qmt._HEALTH_SAMPLER)
 
     def test_application_sends_websocket_pings(self):
         app = qmt.make_app()
