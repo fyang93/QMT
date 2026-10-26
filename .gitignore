@@ -45,3 +45,5 @@ NLP/souhu.h5
 autojs/.vscode/launch.json
 node_project/spider/.vscode/launch.json
 .vscode/
+QMT_SERVICE_backfill.json
+QMT_SERVICE_backfill.json.tmp

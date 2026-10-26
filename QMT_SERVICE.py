@@ -1,9 +1,10 @@
 # -*- coding: gbk -*-
 import json
 import locale
+import os
 import re
+from uuid import uuid4
 from datetime import datetime, timedelta, timezone
-from queue import Empty, Queue
 from threading import Event, Lock, Thread
 from time import monotonic
 from tornado.web import Application, RequestHandler, HTTPError
@@ -35,11 +36,9 @@ _SERVER = None
 _IOLOOP = None
 _STOPPING = False
 _WS_CLIENTS = set()
-_BACKFILL_CONTEXT = None
 _BACKFILL_PENDING = set()
 _BACKFILL_RESULTS = {}
-_BACKFILL_RUNNING = None
-_BACKFILL_QUEUE = Queue()
+_BACKFILL_RUNNING = set()
 _BACKFILL_LOCK = Lock()
 _BACKFILL_STOP = Event()
 _BACKFILL_THREAD = None
@@ -47,10 +46,22 @@ _BACKFILL_NEXT_INCREMENTAL = 0.0
 _BACKFILL_LAST_INCREMENTAL_DATE = ""
 _UNIVERSE_SUBSCRIBED = {}
 _QMT_REALTIME_SYMBOL_LIMIT = 50
-_BACKFILL_FACTOR_SENT = set()
 _HISTORY_DOWNLOAD_BATCH_SIZE = 300
 _HISTORY_MANIFESTS = []
 _HISTORY_SEQUENCE = 0
+_HISTORY_CLIENT_ACKS = {}
+_HISTORY_MANIFEST_LIMIT = 128
+_BRIDGE_ID = uuid4().hex
+_UNIVERSE_CLIENTS = {}
+_REALTIME_SUBSCRIPTIONS = {}
+_REALTIME_RELEASE_AT = {}
+_REALTIME_PUSHER = None
+_ACCOUNT_PUSHER = None
+_REALTIME_LAST_5M = 0.0
+_DISCONNECT_GRACE_SECONDS = 120
+# Some QMT editors omit __file__; the compiled model filename is a fallback at startup.
+_SCRIPT_PATH = globals().get("__file__")
+_BACKFILL_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(_SCRIPT_PATH)), "QMT_SERVICE_backfill.json") if _SCRIPT_PATH else None
 
 
 def safe_call(func, *args, **kwargs):
@@ -99,9 +110,13 @@ def backfill_range(period, start_time="", end_time=""):
         raise ValueError("background backfill only supports 1d, 5m, and 1m")
     today = now.strftime("%Y%m%d")
     session_close = today + "150000"
+    if start_time and len(str(start_time)) == 8:
+        start_time = str(start_time) + "000000"
+    if end_time and len(str(end_time)) == 8:
+        end_time = str(end_time) + "235959"
     return (
         start_time or (now - timedelta(days=days)).strftime("%Y%m%d%H%M%S"),
-        end_time or min(now.strftime("%Y%m%d%H%M%S"), session_close),
+        min(end_time or session_close, now.strftime("%Y%m%d%H%M%S"), session_close),
     )
 
 
@@ -124,23 +139,45 @@ def download_history_range(stocks, period, start_time, end_time):
             downloader(stock, period, start_time, end_time)
 
 
-def download_history_incremental(stocks, period):
-    stocks = parse_list(stocks)
-    downloader = globals().get("download_history_data2")
-    if downloader is not None:
-        try:
-            downloader(stocks, period, "", "", incrementally=True)
-        except TypeError:
-            downloader(stocks, period, "", "")
+def trading_hours(now=None):
+    now = (now or datetime.now(_QMT_TIMEZONE)).astimezone(_QMT_TIMEZONE)
+    return now.weekday() < 5 and "0915" <= now.strftime("%H%M") <= "1505"
+
+
+def load_backfill_results():
+    if not _BACKFILL_STATE_PATH:
+        logger.warning("QMT script filename unavailable; backfill persistence disabled")
         return
-    downloader = globals().get("download_history_data")
-    if downloader is None:
-        raise RuntimeError("download_history_data2/download_history_data not found")
-    for stock in stocks:
-        try:
-            downloader(stock, period, "", "", incrementally=True)
-        except TypeError:
-            downloader(stock, period, "", "")
+    try:
+        with open(_BACKFILL_STATE_PATH, "r", encoding="utf-8") as stream:
+            results = json.load(stream)
+        if not isinstance(results, dict) or any(
+            not isinstance(key, str) or not isinstance(value, dict)
+            or value.get("status") != "success"
+            or not re.fullmatch(r"\d{14}", str(value.get("start_time", "")))
+            or not re.fullmatch(r"\d{14}", str(value.get("end_time", "")))
+            for key, value in results.items()
+        ):
+            raise ValueError("invalid backfill state")
+        _BACKFILL_RESULTS.update(results)
+        logger.info("QMT backfill state loaded: results=%s", len(results))
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError):
+        logger.exception("QMT backfill state unavailable; bounded repair required")
+
+
+def save_backfill_results():
+    if not _BACKFILL_STATE_PATH:
+        return
+    # Called with _BACKFILL_LOCK held; atomic replacement also preserves the old file on failure.
+    temporary = _BACKFILL_STATE_PATH + ".tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as stream:
+            json.dump({key: value for key, value in _BACKFILL_RESULTS.items() if value.get("status") == "success"}, stream)
+        os.replace(temporary, _BACKFILL_STATE_PATH)
+    except OSError:
+        logger.exception("QMT backfill state save failed")
 
 
 def _queue_broadcast(payload, *, history=False, factors=False):
@@ -152,45 +189,62 @@ def _queue_broadcast(payload, *, history=False, factors=False):
 
 def _broadcast(payload, history=False, factors=False):
     for client in list(_WS_CLIENTS):
-        if history and not getattr(client, "wants_history", False):
+        if history:
+            manifest = history_for_client(payload, client)
+            if manifest is not None:
+                client.send_json(manifest)
             continue
         if factors and not getattr(client, "wants_factors", False):
             continue
         client.send_json(payload)
 
 
+def history_for_client(manifest, client):
+    if not getattr(client, "wants_history", False):
+        return None
+    if _UNIVERSE_CLIENTS.get(client.client_id, {}).get("connection") is not client:
+        return None
+    if manifest["id"] in _HISTORY_CLIENT_ACKS.get(client.client_id, set()):
+        return None
+    stocks = [stock for stock in manifest["symbols"] if stock in client.universe]
+    return dict(manifest, symbols=stocks) if stocks else None
+
+
 def _announce_history(stocks, period, start_time, end_time, incremental):
     global _HISTORY_SEQUENCE
-    today = datetime.now(_QMT_TIMEZONE).strftime("%Y%m%d")
-    factor_batch = {}
-    for stock in stocks:
-        factor_key = stock + ":" + today
-        if factor_key in _BACKFILL_FACTOR_SENT:
-            continue
-        factors = safe_call(_BACKFILL_CONTEXT.get_divid_factors, stock)
-        if factors:
-            factor_batch[stock] = to_jsonable(factors)
-        _BACKFILL_FACTOR_SENT.add(factor_key)
-    if factor_batch:
-        _queue_broadcast({"type": "factors", "data": factor_batch}, factors=True)
+    # Factor synchronization uses the existing HTTP endpoint on the model thread,
+    # not redundant background ContextInfo calls or a large IOLoop callback.
+    stocks = sorted(set(stocks))
     with _BACKFILL_LOCK:
+        matching = [item for item in _HISTORY_MANIFESTS if item["period"] == period and item["symbols"] == stocks]
+        for item in matching:
+            start_time = min(start_time, item["start_time"])
+            end_time = max(end_time, item["end_time"])
+            incremental = incremental and item["incremental"]
+        _HISTORY_MANIFESTS[:] = [item for item in _HISTORY_MANIFESTS if item not in matching]
+        # A long-lived bridge must not grow a merged repair beyond its retained window.
+        retained_start = datetime.strptime(end_time, "%Y%m%d%H%M%S") - timedelta(days=BACKFILL_PERIOD_DAYS[period])
+        start_time = max(start_time, retained_start.strftime("%Y%m%d%H%M%S"))
         _HISTORY_SEQUENCE += 1
         manifest = {
             "type": "history_ready",
+            "bridge_id": _BRIDGE_ID,
             "id": str(_HISTORY_SEQUENCE),
             "period": period,
             "symbols": stocks,
             "start_time": start_time,
             "end_time": end_time,
             "incremental": incremental,
-            "count": 1 if incremental else -1,
+            "count": -1,
         }
-        if incremental:
-            _HISTORY_MANIFESTS[:] = [
-                item for item in _HISTORY_MANIFESTS
-                if not (item.get("incremental") and item.get("period") == period and item.get("symbols") == stocks)
-            ]
         _HISTORY_MANIFESTS.append(manifest)
+        if len(_HISTORY_MANIFESTS) > _HISTORY_MANIFEST_LIMIT:
+            # shortcut: keep bounded hints, reconstruct evicted full windows from download state on configure.
+            logger.warning("QMT history manifest limit reached; evicted hints will be rebuilt on configure")
+            del _HISTORY_MANIFESTS[:-_HISTORY_MANIFEST_LIMIT]
+        retained = {item["id"] for item in _HISTORY_MANIFESTS}
+        for acked in _HISTORY_CLIENT_ACKS.values():
+            acked.intersection_update(retained)
     _queue_broadcast(manifest, history=True)
 
 
@@ -223,6 +277,7 @@ def parse_universe(rows):
 
 def set_universe_targets(desired, refresh=False):
     queued = 0
+    reused = {}
     with _BACKFILL_LOCK:
         previous = dict(_UNIVERSE_SUBSCRIBED)
         _UNIVERSE_SUBSCRIBED.clear()
@@ -235,15 +290,159 @@ def set_universe_targets(desired, refresh=False):
                 if refresh:
                     _BACKFILL_RESULTS.pop(stock + ":" + period, None)
                 item = (stock, period)
-                if item not in _BACKFILL_PENDING and item != _BACKFILL_RUNNING:
+                if not refresh and backfill_result_current(stock, period):
+                    reused.setdefault(period, []).append(stock)
+                    continue
+                if item not in _BACKFILL_PENDING and item not in _BACKFILL_RUNNING:
                     _BACKFILL_PENDING.add(item)
-                    _BACKFILL_QUEUE.put(item)
                     queued += 1
+        if refresh:
+            save_backfill_results()
+    for period, stocks in reused.items():
+        start_time, end_time = backfill_range(period)
+        _announce_history(stocks, period, start_time, end_time, False)
     return queued
 
 
-def set_backfill_targets(stocks, refresh=False):
-    return set_universe_targets({stock: False for stock in parse_list(stocks)}, refresh)
+def has_backfill_window(stock, period):
+    result = _BACKFILL_RESULTS.get(stock + ":" + period) or {}
+    start_time = backfill_range(period)[0]
+    return result.get("status") == "success" and str(result.get("start_time", "99999999999999")) <= start_time <= str(result.get("end_time", ""))
+
+
+def backfill_result_current(stock, period):
+    now = datetime.now(_QMT_TIMEZONE)
+    completed = now
+    if now.weekday() >= 5 or now.strftime("%H%M") < "1510":
+        completed -= timedelta(days=1)
+        while completed.weekday() >= 5:
+            completed -= timedelta(days=1)
+    result = _BACKFILL_RESULTS.get(stock + ":" + period) or {}
+    return has_backfill_window(stock, period) and str(result.get("end_time", "")) >= completed.strftime("%Y%m%d") + "150000"
+
+
+def merged_universe(clients):
+    desired = {}
+    for client in clients.values():
+        for stock, subscribed in client["universe"].items():
+            desired[stock] = desired.get(stock, False) or subscribed
+    return desired
+
+
+def set_client_universe(owner, universe, connection=None, refresh=False):
+    clients = dict(_UNIVERSE_CLIENTS)
+    clients[owner] = {"universe": dict(universe), "connection": connection, "expires": None}
+    desired = merged_universe(clients)
+    occupied = {stock for stock, period in _REALTIME_SUBSCRIPTIONS} | {stock for stock, enabled in desired.items() if enabled}
+    if len(occupied) > _QMT_REALTIME_SYMBOL_LIMIT:
+        raise ValueError("combined universe exceeds the 50-symbol realtime subscription limit (including unsubscribe/disconnect grace)")
+    previous_state = _UNIVERSE_CLIENTS.get(owner, {})
+    previous = previous_state.get("connection")
+    newly_needed = set(universe) - set(previous_state.get("universe", {}))
+    existing = set(_UNIVERSE_SUBSCRIBED)
+    _UNIVERSE_CLIENTS.clear()
+    _UNIVERSE_CLIENTS.update(clients)
+    if previous is not None and previous is not connection:
+        previous.close(code=4000, reason="client_id reconnected")
+    queued = set_universe_targets(desired, refresh)
+    # An expanded client scope needs a new manifest ID even if it acked an earlier
+    # filtered view of the same archive. Reuse local data, not another download.
+    if not refresh:
+        with _BACKFILL_LOCK:
+            acked = _HISTORY_CLIENT_ACKS.get(owner, set())
+            expanded = {stock for item in _HISTORY_MANIFESTS if item["id"] in acked for stock in item["symbols"]} & newly_needed & existing
+        for period in _BACKGROUND_BACKFILL_PERIODS + ("1m",):
+            stocks = sorted(stock for stock in expanded if (period != "1m" or universe[stock]) and has_backfill_window(stock, period))
+            if stocks:
+                start_time, end_time = backfill_range(period)
+                _announce_history(stocks, period, start_time, end_time, False)
+    return queued
+
+
+def ensure_history_manifests(universe):
+    # Download completion and client persistence are independent. A restart or
+    # bounded manifest eviction must still expose the whole local retained window.
+    for period in _BACKGROUND_BACKFILL_PERIODS + ("1m",):
+        start_time, end_time = backfill_range(period)
+        with _BACKFILL_LOCK:
+            covered = {stock for item in _HISTORY_MANIFESTS if item["period"] == period and not item["incremental"] and item["start_time"] <= start_time for stock in item["symbols"]}
+            missing = sorted(stock for stock, enabled in universe.items() if (period != "1m" or enabled) and stock not in covered and has_backfill_window(stock, period))
+        for offset in range(0, len(missing), _HISTORY_DOWNLOAD_BATCH_SIZE):
+            _announce_history(missing[offset:offset + _HISTORY_DOWNLOAD_BATCH_SIZE], period, start_time, end_time, False)
+
+
+def disconnect_universe_client(owner, connection):
+    client = _UNIVERSE_CLIENTS.get(owner)
+    if client and client["connection"] is connection:
+        client["connection"] = None
+        client["expires"] = monotonic() + _DISCONNECT_GRACE_SECONDS
+
+
+def expire_universe_clients():
+    previous = {stock for stock, enabled in _UNIVERSE_SUBSCRIBED.items() if enabled}
+    expired = [owner for owner, client in _UNIVERSE_CLIENTS.items() if client["expires"] is not None and client["expires"] <= monotonic()]
+    for owner in expired:
+        del _UNIVERSE_CLIENTS[owner]
+        with _BACKFILL_LOCK:
+            _HISTORY_CLIENT_ACKS.pop(owner, None)
+        logger.info("QMT client grace expired: client_id=%s", owner)
+    if expired:
+        set_universe_targets(merged_universe(_UNIVERSE_CLIENTS))
+        for key in _REALTIME_SUBSCRIPTIONS:
+            if key[0] in previous and not _UNIVERSE_SUBSCRIBED.get(key[0], False):
+                _REALTIME_RELEASE_AT[key] = monotonic()
+        logger.info("QMT universe after expiry: symbols=%s realtime=%s clients=%s", len(_UNIVERSE_SUBSCRIBED), sum(_UNIVERSE_SUBSCRIBED.values()), len(_UNIVERSE_CLIENTS))
+
+
+def refresh_global_subscriptions(ctx):
+    desired = {(stock, period) for stock, enabled in _UNIVERSE_SUBSCRIBED.items() if enabled for period in ("1m", "5m")}
+    for key, sub_id in list(_REALTIME_SUBSCRIPTIONS.items()):
+        if key in desired:
+            _REALTIME_RELEASE_AT.pop(key, None)
+        else:
+            if monotonic() < _REALTIME_RELEASE_AT.setdefault(key, monotonic() + _DISCONNECT_GRACE_SECONDS):
+                continue
+            # Keep a failed unsubscribe tracked so the next tick can retry it.
+            try:
+                ctx.unsubscribe_quote(int(sub_id))
+            except Exception:
+                logger.exception("QMT realtime unsubscribe failed: %s", key)
+                continue
+            del _REALTIME_SUBSCRIPTIONS[key]
+            _REALTIME_RELEASE_AT.pop(key, None)
+    for stock, period in sorted(desired - set(_REALTIME_SUBSCRIPTIONS)):
+        sub_id = safe_call(ctx.subscribe_quote, stock, period, "none")
+        if sub_id is not None:
+            _REALTIME_SUBSCRIPTIONS[stock, period] = sub_id
+
+
+def push_global_market_data():
+    global _REALTIME_LAST_5M
+    expire_universe_clients()
+    ctx = _APP.ContextInfo
+    refresh_global_subscriptions(ctx)
+    for period in ("1m", "5m"):
+        if period == "5m":
+            if monotonic() - _REALTIME_LAST_5M < 5:
+                continue
+            _REALTIME_LAST_5M = monotonic()
+        stocks = sorted(stock for stock, enabled in _UNIVERSE_SUBSCRIBED.items() if enabled and (stock, period) in _REALTIME_SUBSCRIPTIONS)
+        if not stocks:
+            continue
+        data = safe_call(ctx.get_market_data_ex, list(_QMT_FIELDS), stocks, period, "", "", 2, "none", False, False)
+        if not isinstance(data, dict):
+            continue
+        data = to_jsonable(data)
+        for client in list(_WS_CLIENTS):
+            if _UNIVERSE_CLIENTS.get(client.client_id, {}).get("connection") is not client:
+                continue
+            selected = {stock: bars for stock, bars in data.items() if client.universe.get(stock, False)}
+            if selected:
+                client.send_json({"type": "bar", "period": period, "stocks": sorted(selected), "fields": list(_QMT_FIELDS), "count": 2, "data": selected})
+
+
+def set_backfill_targets(stocks, refresh=False, owner="http"):
+    return set_client_universe(owner, {stock.upper(): False for stock in parse_list(stocks)}, refresh=refresh)
 
 
 def schedule_incremental_backfill():
@@ -260,82 +459,95 @@ def schedule_incremental_backfill():
             (stock, period)
             for stock in sorted(_UNIVERSE_SUBSCRIBED)
             for period in _BACKGROUND_BACKFILL_PERIODS + (("1m",) if _UNIVERSE_SUBSCRIBED[stock] else ())
-            if (_BACKFILL_RESULTS.get(stock + ":" + period) or {}).get("status") != "success"
-            or (_BACKFILL_RESULTS.get(stock + ":" + period) or {}).get("trade_date") != today
+            if not backfill_result_current(stock, period)
         ]
         if not missing:
             _BACKFILL_LAST_INCREMENTAL_DATE = today
             return
-        for item in missing:
-            _BACKFILL_PENDING.add(item)
-            _BACKFILL_QUEUE.put(item)
+        _BACKFILL_PENDING.update(missing)
         _BACKFILL_NEXT_INCREMENTAL = monotonic() + INCREMENTAL_INTERVAL_SECONDS
         queued = len(_BACKFILL_PENDING)
     if queued:
         logger.info("QMT intraday incremental backfill queued: tasks=%s", queued)
 
 
+def take_backfill_batch():
+    with _BACKFILL_LOCK:
+        _BACKFILL_PENDING.intersection_update({
+            item for item in _BACKFILL_PENDING
+            if item[0] in _UNIVERSE_SUBSCRIBED and (item[1] != "1m" or _UNIVERSE_SUBSCRIBED[item[0]])
+        })
+        intraday = trading_hours()
+        eligible = [item for item in _BACKFILL_PENDING - _BACKFILL_RUNNING if not intraday or item[1] == "1m"]
+        if not eligible:
+            return []
+        eligible.sort(key=lambda item: ({"1d": 0, "1m": 1, "5m": 2}[item[1]], not _UNIVERSE_SUBSCRIBED[item[0]], item[0]))
+        period = eligible[0][1]
+        incremental = has_backfill_window(eligible[0][0], period)
+        batch = [item for item in eligible if item[1] == period and has_backfill_window(item[0], period) == incremental][:(10 if intraday else _HISTORY_DOWNLOAD_BATCH_SIZE)]
+        _BACKFILL_PENDING.difference_update(batch)
+        _BACKFILL_RUNNING.update(batch)
+        return batch
+
+
 def backfill_worker():
-    global _BACKFILL_RUNNING
     while not _BACKFILL_STOP.is_set():
         schedule_incremental_backfill()
-        try:
-            item = _BACKFILL_QUEUE.get(timeout=0.5)
-        except Empty:
+        batch = take_backfill_batch()
+        if not batch:
+            _BACKFILL_STOP.wait(0.5)
             continue
-        stock, period = item
-        with _BACKFILL_LOCK:
-            if stock not in _UNIVERSE_SUBSCRIBED or item not in _BACKFILL_PENDING or (period == "1m" and not _UNIVERSE_SUBSCRIBED[stock]):
-                _BACKFILL_PENDING.discard(item)
-                _BACKFILL_QUEUE.task_done()
-                continue
-            # ponytail: warm daily and subscribed 1m data before the full-universe 5m archive.
-            priority = min(_BACKFILL_PENDING, key=lambda candidate: ({"1d": 0, "1m": 1, "5m": 2}[candidate[1]], candidate[0]))
-            if item != priority:
-                _BACKFILL_QUEUE.put(item)
-                stock, period = priority
-            batch = [(stock, period)]
-            for candidate in sorted(
-                _BACKFILL_PENDING,
-                key=lambda value: (not _UNIVERSE_SUBSCRIBED.get(value[0], False), value[0]),
-            ):
-                if candidate != (stock, period) and candidate[1] == period:
-                    batch.append(candidate)
-                    if len(batch) >= _HISTORY_DOWNLOAD_BATCH_SIZE:
-                        break
-            for candidate in batch:
-                _BACKFILL_PENDING.discard(candidate)
-            _BACKFILL_RUNNING = (period, len(batch))
-        stocks = sorted({candidate[0] for candidate in batch})
+        period = batch[0][1]
+        stocks = sorted({item[0] for item in batch})
         try:
             start_time, end_time = backfill_range(period)
-            incremental = all((_BACKFILL_RESULTS.get(stock + ":" + period) or {}).get("status") == "success" for stock in stocks)
+            with _BACKFILL_LOCK:
+                previous = [_BACKFILL_RESULTS.get(stock + ":" + period) or {} for stock in stocks]
+            incremental = all(has_backfill_window(stock, period) for stock in stocks)
+            if incremental:
+                # Explicit overlap repairs partial bars; never ask QMT to infer an empty-start download.
+                earliest = min(datetime.strptime(result["end_time"], "%Y%m%d%H%M%S") for result in previous)
+                start_time = max(start_time, (earliest - timedelta(days=7)).strftime("%Y%m%d%H%M%S"))
             logger.info(
                 "QMT history backfill started: %s symbols=%s mode=%s range=%s..%s",
                 period, len(stocks), "incremental" if incremental else "bounded", start_time, end_time,
             )
-            if incremental:
-                download_history_incremental(stocks, period)
-            else:
-                download_history_range(stocks, period, start_time, end_time)
+            # Recheck after selecting a batch: an opening boundary must defer archive downloads.
+            if trading_hours() and period != "1m":
+                with _BACKFILL_LOCK:
+                    _BACKFILL_PENDING.update(batch)
+                    _BACKFILL_RUNNING.difference_update(batch)
+                continue
+            download_history_range(stocks, period, start_time, end_time)
             _announce_history(stocks, period, start_time, end_time, incremental)
-            result = {"status": "success", "period": period, "trade_date": datetime.now(_QMT_TIMEZONE).strftime("%Y%m%d"), "mode": "incremental" if incremental else "bounded_incremental", "bars": None}
+            result = {"status": "success", "period": period, "trade_date": datetime.now(_QMT_TIMEZONE).strftime("%Y%m%d"), "start_time": start_time, "end_time": end_time, "mode": "incremental" if incremental else "bounded_incremental", "bars": None}
             logger.info("QMT history backfill complete: %s symbols=%s mode=%s", period, len(stocks), result["mode"])
-            results = {stock + ":" + period: result for stock in stocks}
+            results = {stock + ":" + period: dict(result, **completed_download_range(old, start_time, end_time)) for stock, old in zip(stocks, previous)}
         except Exception as e:
             logger.exception("QMT history backfill failed: %s symbols=%s", period, len(stocks))
-            results = {stock + ":" + period: {"status": "failed", "period": period, "error": str(e)} for stock in stocks}
+            with _BACKFILL_LOCK:
+                results = {
+                    stock + ":" + period: dict(_BACKFILL_RESULTS[stock + ":" + period], last_error=str(e))
+                    if (_BACKFILL_RESULTS.get(stock + ":" + period) or {}).get("status") == "success"
+                    else {"status": "failed", "period": period, "error": str(e)}
+                    for stock in stocks
+                }
         with _BACKFILL_LOCK:
             _BACKFILL_RESULTS.update(results)
-            _BACKFILL_RUNNING = None
-        _BACKFILL_QUEUE.task_done()
+            _BACKFILL_RUNNING.difference_update(batch)
+            save_backfill_results()
 
 
-def start_backfill_worker(ctx):
-    global _BACKFILL_CONTEXT, _BACKFILL_THREAD
-    _BACKFILL_CONTEXT = ctx
+def start_backfill_worker():
+    global _BACKFILL_THREAD, _BACKFILL_STATE_PATH
     if _BACKFILL_THREAD and _BACKFILL_THREAD.is_alive():
         return
+    if _BACKFILL_STATE_PATH is None:
+        filename = start_backfill_worker.__code__.co_filename
+        if filename and not filename.startswith("<"):
+            _BACKFILL_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(filename)), "QMT_SERVICE_backfill.json")
+    logger.info("QMT backfill state path: %s", _BACKFILL_STATE_PATH)
+    load_backfill_results()
     _BACKFILL_STOP.clear()
     _BACKFILL_THREAD = Thread(target=backfill_worker, name="qmt-history-backfill", daemon=True)
     _BACKFILL_THREAD.start()
@@ -415,6 +627,12 @@ def account_status_payload():
     }
 
 
+def push_account_status():
+    payload = account_status_payload()
+    if payload is not None:
+        _broadcast({"type": "account_status", "data": payload})
+
+
 # ============= BaseHandler =============
 
 AUTH_EXEMPT = set()
@@ -487,14 +705,10 @@ class BaseHandler(RequestHandler):
 
 class MarketWebSocketHandler(WebSocketHandler):
     def initialize(self):
-        self.subscriptions = {}
         self.universe = {}
+        self.client_id = "ws:%s" % id(self)
         self.wants_history = False
         self.wants_factors = False
-        self.wants_account = False
-        self.push_interval_ms = 1000
-        self.pusher = None
-        self.account_pusher = None
 
     def check_origin(self, origin):
         return True
@@ -505,19 +719,13 @@ class MarketWebSocketHandler(WebSocketHandler):
             self.close(code=4001, reason="认证失败：token 无效或缺失")
             return
         _WS_CLIENTS.add(self)
-        self.pusher = PeriodicCallback(self.push_market_data, self.push_interval_ms)
-        self.pusher.start()
-        self.send_json({"type": "connected", "message": "QMT websocket connected"})
+        logger.info("QMT websocket opened: addr=%s client_id=%s symbols=0 global_symbols=%s global_realtime=%s", self.request.remote_ip, self.client_id, len(_UNIVERSE_SUBSCRIBED), sum(_UNIVERSE_SUBSCRIBED.values()))
+        self.send_json({"type": "connected", "bridge_id": _BRIDGE_ID, "message": "QMT websocket connected"})
 
     def on_close(self):
         _WS_CLIENTS.discard(self)
-        if self.pusher:
-            self.pusher.stop()
-            self.pusher = None
-        if self.account_pusher:
-            self.account_pusher.stop()
-            self.account_pusher = None
-        self.unsubscribe_all()
+        disconnect_universe_client(self.client_id, self)
+        logger.info("QMT websocket closed: addr=%s client_id=%s symbols=%s realtime=%s global_symbols=%s global_realtime=%s grace_seconds=%s", self.request.remote_ip, self.client_id, len(self.universe), sum(self.universe.values()), len(_UNIVERSE_SUBSCRIBED), sum(_UNIVERSE_SUBSCRIBED.values()), _DISCONNECT_GRACE_SECONDS)
 
     def on_message(self, message):
         try:
@@ -532,6 +740,9 @@ class MarketWebSocketHandler(WebSocketHandler):
                 self.send_json({"type": "error", "message": "message must be json object"})
                 return
 
+        if not isinstance(data, dict):
+            self.send_json({"type": "error", "message": "message must be json object"})
+            return
         action = data.get("action", "ping")
         if action == "ping":
             self.send_json({"type": "pong"})
@@ -540,36 +751,40 @@ class MarketWebSocketHandler(WebSocketHandler):
         elif action == "history_ack":
             self.handle_history_ack(data)
         elif action == "account_status":
-            self.wants_account = True
-            if not self.account_pusher:
-                self.account_pusher = PeriodicCallback(self.push_account_status, 60000)
-                self.account_pusher.start()
-            self.push_account_status()
+            push_account_status()
         elif action == "subscribe":
             self.handle_subscribe(data)
         elif action == "unsubscribe":
             self.handle_unsubscribe(data)
         elif action == "subscriptions":
-            self.send_json({"type": "subscriptions", "subscriptions": self.subscriptions})
+            self.send_json({"type": "subscriptions", "subscriptions": [
+                {"stock_code": stock, "period": period, "sub_id": sub_id}
+                for (stock, period), sub_id in _REALTIME_SUBSCRIPTIONS.items() if self.universe.get(stock, False)
+            ]})
         else:
             self.send_json({"type": "error", "message": "unknown action: %s" % action})
 
     def handle_configure(self, data):
         try:
             universe = parse_universe(data.get("universe"))
+            client_id = data.get("client_id", self.client_id)
+            if not isinstance(client_id, str) or not client_id.strip() or len(client_id) > 1024 or any(ord(char) < 32 for char in client_id):
+                raise ValueError("client_id must be a non-empty string of at most 1024 characters")
+            if self.wants_history and client_id != self.client_id:
+                raise ValueError("client_id cannot change on a configured connection")
+            queued = set_client_universe(client_id, universe, self, refresh=parse_bool(data.get("refresh_history")))
         except ValueError as exc:
             self.send_json({"type": "error", "message": str(exc)})
             return
+        self.client_id = client_id
         self.universe = universe
         self.wants_history = True
         self.wants_factors = True
-        queued = set_universe_targets(
-            self.universe,
-            refresh=parse_bool(data.get("refresh_history")),
-        )
+        ensure_history_manifests(self.universe)
         logger.info(
-            "QMT universe configured: symbols=%s realtime=%s backfill_tasks=%s",
-            len(self.universe), sum(self.universe.values()), queued,
+            "QMT universe configured: symbols=%s realtime=%s backfill_tasks=%s addr=%s client_id=%s global_symbols=%s global_realtime=%s clients=%s",
+            len(self.universe), sum(self.universe.values()), queued, self.request.remote_ip, self.client_id,
+            len(_UNIVERSE_SUBSCRIBED), sum(_UNIVERSE_SUBSCRIBED.values()), len(_UNIVERSE_CLIENTS),
         )
         self.refresh_subscriptions()
         self.send_json({
@@ -577,171 +792,49 @@ class MarketWebSocketHandler(WebSocketHandler):
             "symbols": len(self.universe),
             "queued": queued,
             "realtime": sum(self.universe.values()),
+            "bridge_id": _BRIDGE_ID,
+            "global_symbols": len(_UNIVERSE_SUBSCRIBED),
+            "global_realtime": sum(_UNIVERSE_SUBSCRIBED.values()),
         })
         with _BACKFILL_LOCK:
             manifests = list(_HISTORY_MANIFESTS)
         for manifest in manifests:
-            self.send_json(manifest)
+            selected = history_for_client(manifest, self)
+            if selected is not None:
+                self.send_json(selected)
 
     def handle_history_ack(self, data):
         manifest_id = str(data.get("id", ""))
+        if data.get("bridge_id", _BRIDGE_ID) != _BRIDGE_ID:
+            self.send_json({"type": "error", "message": "history_ack bridge_id mismatch"})
+            return
         with _BACKFILL_LOCK:
-            _HISTORY_MANIFESTS[:] = [item for item in _HISTORY_MANIFESTS if item.get("id") != manifest_id]
-        self.send_json({"type": "history_acked", "id": manifest_id})
+            if any(item["id"] == manifest_id for item in _HISTORY_MANIFESTS):
+                _HISTORY_CLIENT_ACKS.setdefault(self.client_id, set()).add(manifest_id)
+        self.send_json({"type": "history_acked", "bridge_id": _BRIDGE_ID, "id": manifest_id})
 
     def refresh_subscriptions(self):
-        desired = {
-            symbol for symbol, subscribed in self.universe.items()
-            if subscribed
-        }
-        current = {item.get("stock_code") for item in self.subscriptions.values()}
-        for key, item in list(self.subscriptions.items()):
-            if item.get("stock_code") not in desired:
-                if item.get("sub_id") is not None:
-                    safe_call(self.application.ContextInfo.unsubscribe_quote, int(item["sub_id"]))
-                self.subscriptions.pop(key, None)
-        current = {item.get("stock_code") for item in self.subscriptions.values()}
-        for stock in sorted(desired - current):
-            for period in ("1m", "5m"):
-                sub_id = safe_call(self.application.ContextInfo.subscribe_quote, stock, period, "none")
-                self.subscriptions[str(sub_id) if sub_id is not None else stock + ":" + period] = {
-                    "stock_code": stock, "period": period, "qmt_period": period,
-                    "dividend_type": "none", "fields": list(_QMT_FIELDS), "count": 1, "sub_id": sub_id,
-                }
-
-    def push_account_status(self):
-        payload = account_status_payload()
-        if payload is not None:
-            self.send_json({"type": "account_status", "data": payload})
+        refresh_global_subscriptions(self.application.ContextInfo)
 
     def handle_subscribe(self, data):
-        stock_list = parse_list(data.get("stock_code", data.get("stocks", data.get("stock", ""))))
-        if not stock_list:
-            self.send_json({"type": "error", "message": "need stock_code"})
+        # Legacy bar subscriptions share the configured universe, never a second QMT subscription.
+        stocks = parse_list(data.get("stock_code", data.get("stocks", data.get("stock", ""))))
+        if not stocks or data.get("period", "1m") not in ("1m", "5m"):
+            self.send_json({"type": "error", "message": "use configure universe for 1m/5m bars; tick data uses HTTP full_tick"})
             return
-
-        period = str(data.get("period", "1m")).strip()
-        qmt_period = "tick" if period in ("full_tick", "fulltick") else period
-        dividend_type = data.get("dividend_type", "follow")
-        fields = parse_list(data.get("fields", "open,high,low,close,volume,amount"))
-        count = int(data.get("count", "1"))
-        interval_ms = int(data.get("interval_ms", self.push_interval_ms))
-        if interval_ms < 500:
-            interval_ms = 500
-        if interval_ms != self.push_interval_ms:
-            self.push_interval_ms = interval_ms
-            if self.pusher:
-                self.pusher.stop()
-                self.pusher = PeriodicCallback(self.push_market_data, self.push_interval_ms)
-                self.pusher.start()
-
-        results = []
-        for stock in stock_list:
-            sub_id = safe_call(self.application.ContextInfo.subscribe_quote, stock, qmt_period, dividend_type)
-            self.subscriptions[str(sub_id) if sub_id is not None else stock] = {
-                "stock_code": stock,
-                "period": period,
-                "qmt_period": qmt_period,
-                "dividend_type": dividend_type,
-                "fields": fields,
-                "count": count,
-                "sub_id": sub_id,
-            }
-            results.append({
-                "stock_code": stock,
-                "period": period,
-                "sub_id": sub_id,
-                "status": "success" if sub_id is not None else "failed",
-            })
-
-        self.send_json({"type": "subscribed", "results": results})
-        self.push_market_data()
+        universe = dict(self.universe)
+        universe.update({stock.upper(): True for stock in stocks})
+        self.handle_configure({"client_id": self.client_id, "universe": [
+            {"symbol": stock, "subscribed": subscribed} for stock, subscribed in universe.items()
+        ]})
 
     def handle_unsubscribe(self, data):
-        sub_ids = parse_list(data.get("sub_id", data.get("sub_ids", "")))
         stocks = set(parse_list(data.get("stock_code", data.get("stocks", ""))))
-
-        removed = []
-        for key, item in list(self.subscriptions.items()):
-            sub_id = item.get("sub_id")
-            stock_code = item.get("stock_code")
-            if (sub_ids and str(sub_id) in sub_ids) or (stocks and stock_code in stocks):
-                if sub_id is not None:
-                    safe_call(self.application.ContextInfo.unsubscribe_quote, int(sub_id))
-                removed.append(item)
-                self.subscriptions.pop(key, None)
-
-        self.send_json({"type": "unsubscribed", "removed": removed})
-
-    def unsubscribe_all(self):
-        for item in list(self.subscriptions.values()):
-            sub_id = item.get("sub_id")
-            if sub_id is not None:
-                safe_call(self.application.ContextInfo.unsubscribe_quote, int(sub_id))
-        self.subscriptions.clear()
-
-    def push_market_data(self):
-        if not self.subscriptions:
-            return
-
-        groups = {}
-        for item in self.subscriptions.values():
-            period = item.get("period", "1m")
-            qmt_period = item.get("qmt_period", period)
-            fields = tuple(item.get("fields") or [])
-            dividend_type = item.get("dividend_type", "follow")
-            count = int(item.get("count", 1))
-            key = (period, qmt_period, fields, dividend_type, count)
-            groups.setdefault(key, []).append(item.get("stock_code"))
-
-        for key, stocks in groups.items():
-            period, qmt_period, fields, dividend_type, count = key
-            stocks = sorted(set(stocks))
-            if qmt_period == "tick":
-                data = safe_call(self.application.ContextInfo.get_full_tick, stocks)
-                if data is None:
-                    self.send_json({
-                        "type": "error",
-                        "period": period,
-                        "message": "get_full_tick failed",
-                        "stocks": stocks,
-                    })
-                    continue
-                self.send_json({
-                    "type": "tick",
-                    "period": period,
-                    "stocks": stocks,
-                    "data": to_jsonable(data),
-                })
-                continue
-
-            data = safe_call(
-                self.application.ContextInfo.get_market_data_ex,
-                list(fields),
-                stocks,
-                qmt_period,
-                "",
-                "",
-                count,
-                dividend_type,
-            )
-            if data is None:
-                self.send_json({
-                    "type": "error",
-                    "period": period,
-                    "message": "get_market_data_ex failed",
-                    "stocks": stocks,
-                })
-                continue
-
-            self.send_json({
-                "type": "bar",
-                "period": period,
-                "stocks": stocks,
-                "fields": list(fields),
-                "count": count,
-                "data": to_jsonable(data),
-            })
+        sub_ids = set(parse_list(data.get("sub_id", data.get("sub_ids", ""))))
+        stocks.update(stock for (stock, period), sub_id in _REALTIME_SUBSCRIPTIONS.items() if str(sub_id) in sub_ids)
+        self.handle_configure({"client_id": self.client_id, "universe": [
+            {"symbol": stock, "subscribed": enabled and stock not in stocks} for stock, enabled in self.universe.items()
+        ]})
 
     def send_json(self, data):
         if self.ws_connection is None:
@@ -919,7 +1012,72 @@ class DateLocationHandler(BaseHandler):
         ret = safe_call(self.ctx().get_date_location, strdate)
         self.write(json.dumps({"strdate": strdate, "location": ret}, ensure_ascii=False))
 
-# 历史行情：同步按明确范围下载完成，再读取不填充、不订阅的本地数据。
+def completed_download_range(previous, start_time, end_time):
+    if previous.get("status") == "success" and previous.get("start_time", "99999999999999") <= end_time and start_time <= previous.get("end_time", ""):
+        start_time = min(start_time, previous["start_time"])
+        end_time = max(end_time, previous["end_time"])
+    return {"start_time": start_time, "end_time": end_time}
+
+
+def download_history_page(stocks, period, start_time, end_time):
+    # HTTP repairs share the worker's pair reservations and persisted range cache.
+    with _BACKFILL_LOCK:
+        needed = [stock for stock in stocks if not (
+            (_BACKFILL_RESULTS.get(stock + ":" + period) or {}).get("status") == "success"
+            and (_BACKFILL_RESULTS[stock + ":" + period].get("start_time") or "99999999999999") <= start_time
+            and _BACKFILL_RESULTS[stock + ":" + period]["end_time"] >= end_time
+        )]
+        batch = {(stock, period) for stock in needed}
+        if batch & _BACKFILL_RUNNING:
+            raise HTTPError(503, "history download already running; retry local reads later")
+        _BACKFILL_RUNNING.update(batch)
+        _BACKFILL_PENDING.difference_update(batch)
+        previous = [_BACKFILL_RESULTS.get(stock + ":" + period) or {} for stock in needed]
+        # Join an older cached range through the intervening gap, never claim
+        # continuous coverage by merely taking the min/max of disjoint downloads.
+        download_start = min([start_time] + [item["end_time"] for item in previous if item.get("status") == "success"])
+        download_end = max([end_time] + [item["start_time"] for item in previous if item.get("status") == "success"])
+    if not needed:
+        return
+    failed = False
+    try:
+        download_history_range(needed, period, download_start, download_end)
+        with _BACKFILL_LOCK:
+            for stock in needed:
+                previous = _BACKFILL_RESULTS.get(stock + ":" + period) or {}
+                _BACKFILL_RESULTS[stock + ":" + period] = dict(status="success", **completed_download_range(previous, download_start, download_end))
+            save_backfill_results()
+        _announce_history(needed, period, start_time, end_time, False)
+    except Exception:
+        failed = True
+        raise
+    finally:
+        with _BACKFILL_LOCK:
+            _BACKFILL_RUNNING.difference_update(batch)
+            # Release and retry atomically: a worker must never inherit our reservation
+            # between requeue and cleanup. Partial HTTP repairs still owe the archive.
+            _BACKFILL_PENDING.update(item for item in batch if item[0] in _UNIVERSE_SUBSCRIBED and (failed or not backfill_result_current(*item)))
+
+
+def validate_history_page(stocks, period, start_time, end_time, count):
+    # Bound model-thread local reads too; clients page archives rather than monopolize the IOLoop.
+    if len(stocks) > (20 if period == "1d" else 5):
+        raise HTTPError(400, "history page exceeds symbol limit (20 daily / 5 intraday)")
+    if count == 0 or count < -1 or count > (366 if period == "1d" else 2000):
+        raise HTTPError(400, "history count exceeds page limit")
+    if count == -1 and (not start_time or not end_time):
+        raise HTTPError(400, "unbounded history requires explicit start_time and end_time")
+    if start_time and end_time:
+        try:
+            start = datetime.strptime(str(start_time), "%Y%m%d" if len(str(start_time)) == 8 else "%Y%m%d%H%M%S")
+            end = datetime.strptime(str(end_time), "%Y%m%d" if len(str(end_time)) == 8 else "%Y%m%d%H%M%S")
+        except ValueError:
+            raise HTTPError(400, "history timestamps must be YYYYMMDD or YYYYMMDDhhmmss")
+        if end < start or end - start > timedelta(days=366 if period == "1d" else 7):
+            raise HTTPError(400, "history page exceeds time range (366 daily / 7 intraday days)")
+
+
+# 盘中只读有界本地分页；补数由全局后台队列负责。
 class HistoryDataHandler(BaseHandler):
     def post(self):
         data = self.json_body()
@@ -936,15 +1094,23 @@ class HistoryDataHandler(BaseHandler):
         fields = data.get('fields', data.get('field', 'open,high,low,close,volume'))
         fields_list = parse_list(fields)
         do_download = parse_bool(data.get('download', True), True)
+        if do_download and trading_hours():
+            self.set_header("Retry-After", "60")
+            raise HTTPError(503, "history downloads are deferred during 09:15-15:05 Beijing weekdays; use download=false for local reads")
+        validate_history_page(stock_list, period, start_time, end_time, count)
 
         download_results = {}
         if do_download:
             if period not in BACKFILL_PERIOD_DAYS:
                 raise HTTPError(400, "history download only supports 1d and 5m")
             start_time, end_time = backfill_range(period, start_time, end_time)
+            if start_time > end_time:
+                raise HTTPError(400, "history download range has no elapsed bars")
             try:
-                download_history_range(stock_list, period, start_time, end_time)
+                download_history_page(stock_list, period, start_time, end_time)
                 download_results = {stock: "success" for stock in stock_list}
+            except HTTPError:
+                raise
             except Exception as e:
                 logger.exception("QMT history download failed")
                 raise HTTPError(502, "历史行情下载失败: %s" % e)
@@ -977,7 +1143,8 @@ class BackfillTargetsHandler(BaseHandler):
     def update_targets(self):
         data = self.json_body()
         stocks = data.get('symbols', data.get('stock_code', data.get('stocks', '')))
-        queued = set_backfill_targets(stocks, parse_bool(data.get('refresh', False)))
+        queued = set_backfill_targets(stocks, parse_bool(data.get('refresh', False)), owner="http:" + self.request.remote_ip)
+        logger.info("QMT HTTP backfill configured: addr=%s symbols=%s global_symbols=%s global_realtime=%s queued=%s", self.request.remote_ip, len(parse_list(stocks)), len(_UNIVERSE_SUBSCRIBED), sum(_UNIVERSE_SUBSCRIBED.values()), queued)
         self.set_status(202)
         self.write(json.dumps({
             "status": "accepted",
@@ -991,7 +1158,7 @@ class BackfillStatusHandler(BaseHandler):
         with _BACKFILL_LOCK:
             running = None
             if _BACKFILL_RUNNING:
-                running = {"period": _BACKFILL_RUNNING[0], "symbols": _BACKFILL_RUNNING[1]}
+                running = {"period": next(iter(_BACKFILL_RUNNING))[1], "symbols": len(_BACKFILL_RUNNING)}
             payload = {
                 "targets": len(_UNIVERSE_SUBSCRIBED),
                 "pending": len(_BACKFILL_PENDING),
@@ -1355,34 +1522,12 @@ class LocalDataHandler(BaseHandler):
 # ContextInfo.subscribe_quote() - 订阅行情数据
 class SubscribeQuoteHandler(BaseHandler):
     def post(self):
-        data = self.json_body()
-        stock_code = data.get('stock_code', data.get('stocks', data.get('stock', '')))
-        stock_list = parse_list(stock_code)
-        if not stock_list:
-            raise HTTPError(400, "need args stock_code")
-        period = data.get('period', 'follow')
-        dividend_type = data.get('dividend_type', 'follow')
-        results = []
-        for stock in stock_list:
-            sub_id = safe_call(self.ctx().subscribe_quote, stock, period, dividend_type)
-            results.append({
-                "stock_code": stock,
-                "status": "success" if sub_id is not None else "failed",
-                "sub_id": sub_id,
-            })
-        self.write(json.dumps({
-            "status": "success" if all(item["sub_id"] is not None for item in results) else "partial_failed",
-            "results": results,
-            "sub_id": results[0]["sub_id"] if len(results) == 1 else None,
-        }, ensure_ascii=False))
+        raise HTTPError(409, "quotes are globally owned; use websocket configure universe")
 
-# ContextInfo.unsubscribe_quote() - 反订阅行情数据
+
 class UnsubscribeQuoteHandler(BaseHandler):
     def post(self):
-        data = self.json_body()
-        sub_id = int(data.get('sub_id', '0'))
-        safe_call(self.ctx().unsubscribe_quote, sub_id)
-        self.write(json.dumps({"status": "success", "sub_id": sub_id}, ensure_ascii=False))
+        raise HTTPError(409, "quotes are globally owned; use websocket configure universe")
 
 
 # ============= 3. 判定函数 (is_*) =============
@@ -2241,11 +2386,18 @@ def make_app():
         (r"/api/sys/python_version", PythonVersionHandler),
         (r"/api/sys/shutdown", ShutdownHandler),
 
-    ], debug=False, compress_response=True)
+    ], debug=False, compress_response=True, websocket_ping_interval=30, websocket_ping_timeout=30)
 
 
 def _stop_server_on_ioloop(reason):
     global _SERVER
+    for callback in (_REALTIME_PUSHER, _ACCOUNT_PUSHER):
+        if callback is not None:
+            callback.stop()
+    if _APP is not None:
+        for sub_id in list(_REALTIME_SUBSCRIPTIONS.values()):
+            safe_call(_APP.ContextInfo.unsubscribe_quote, int(sub_id))
+        _REALTIME_SUBSCRIPTIONS.clear()
     logger.info("QMT HTTP Server shutdown requested: %s; releasing port 0.0.0.0:%s", reason, PORT)
     for client in list(_WS_CLIENTS):
         try:
@@ -2276,7 +2428,7 @@ def _shutdown_server(reason="stop"):
 
 
 def init(ContextInfo):
-    global _APP, _SERVER, _IOLOOP, _STOPPING
+    global _APP, _SERVER, _IOLOOP, _STOPPING, _REALTIME_PUSHER, _ACCOUNT_PUSHER
     loop = None
     try:
         if _SERVER is not None:
@@ -2300,7 +2452,11 @@ def init(ContextInfo):
         _APP = app
         _SERVER = HTTPServer(app)
         _SERVER.listen(PORT, address='0.0.0.0')
-        start_backfill_worker(ContextInfo)
+        start_backfill_worker()
+        _REALTIME_PUSHER = PeriodicCallback(push_global_market_data, 1000)
+        _REALTIME_PUSHER.start()
+        _ACCOUNT_PUSHER = PeriodicCallback(push_account_status, 60000)
+        _ACCOUNT_PUSHER.start()
         _STOPPING = False
         logger.info(f"QMT HTTP Server 启动于 http://0.0.0.0:{PORT} (全部API已加载，模型线程运行)")
         loop.start()
