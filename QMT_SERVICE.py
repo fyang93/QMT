@@ -232,6 +232,8 @@ def set_universe_targets(desired, refresh=False):
         for stock in sorted(added | promoted, key=lambda symbol: (not desired[symbol], symbol)):
             periods = (_BACKGROUND_BACKFILL_PERIODS if stock in added else ()) + (("1m",) if desired[stock] else ())
             for period in periods:
+                if refresh:
+                    _BACKFILL_RESULTS.pop(stock + ":" + period, None)
                 item = (stock, period)
                 if item not in _BACKFILL_PENDING and item != _BACKFILL_RUNNING:
                     _BACKFILL_PENDING.add(item)
