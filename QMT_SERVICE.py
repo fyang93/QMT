@@ -2262,6 +2262,7 @@ class HealthHandler(BaseHandler):
             "realtime": {
                 "last_push_at": _REALTIME_LAST_PUSH_AT,
                 "pushed_symbol_count": _REALTIME_PUSHED_SYMBOL_COUNT,
+                "symbol_count": sum(_UNIVERSE_SUBSCRIBED.values()),
                 "subscription_count": len(_REALTIME_SUBSCRIPTIONS),
             },
             "universe_size": universe_size,

@@ -494,7 +494,7 @@ class UniverseProtocolTest(unittest.TestCase):
             "bridge_id": qmt._BRIDGE_ID,
             "started_at": qmt._STARTED_AT,
             "ioloop_lag_ms": {"latest": None, "max_60s": None},
-            "realtime": {"last_push_at": None, "pushed_symbol_count": 0, "subscription_count": 0},
+            "realtime": {"last_push_at": None, "pushed_symbol_count": 0, "symbol_count": 0, "subscription_count": 0},
             "universe_size": 0,
             "backfill": {"pending": 0, "running": 0},
             "clients": [],
@@ -519,6 +519,7 @@ class UniverseProtocolTest(unittest.TestCase):
         ])
         self.assertEqual(qmt._UNIVERSE_CLIENTS["first"], before)
         self.assertEqual(payload["universe_size"], 2)
+        self.assertEqual(payload["realtime"]["symbol_count"], 1)
         self.assertEqual(payload["realtime"]["subscription_count"], 2)  # 1m + 5m native handles.
         self.assertEqual(payload["backfill"], {"pending": 4, "running": 1})
         self.assertIsNotNone(datetime.fromisoformat(expiry).utcoffset())
@@ -576,6 +577,7 @@ class UniverseProtocolTest(unittest.TestCase):
             qmt.push_global_market_data()
         payload = self.health()
         self.assertEqual(payload["realtime"]["pushed_symbol_count"], 2)
+        self.assertEqual(payload["realtime"]["symbol_count"], 2)
         self.assertEqual(payload["realtime"]["subscription_count"], 4)
         self.assertEqual(self.client.send_json.call_count, 2)
         self.assertIsNotNone(datetime.fromisoformat(payload["realtime"]["last_push_at"]).utcoffset())
