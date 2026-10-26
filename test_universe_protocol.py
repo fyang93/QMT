@@ -50,7 +50,7 @@ class UniverseProtocolTest(unittest.TestCase):
         qmt._WS_CLIENTS.clear()
         qmt._HISTORY_SEQUENCE = 0
         qmt._REALTIME_LAST_5M = 0
-        qmt._IOLOOP_NEXT_TICK = None
+        qmt._IOLOOP_LAST_TICK = None
         qmt._IOLOOP_LAG_SAMPLES.clear()
         qmt._REALTIME_LAST_PUSH_AT = None
         qmt._REALTIME_PUSHED_SYMBOL_COUNT = 0
@@ -475,6 +475,18 @@ class UniverseProtocolTest(unittest.TestCase):
             self.assertEqual(error.exception.args[0], 401)
         self.health()  # A valid token is accepted.
 
+    def test_health_does_not_wait_for_backfill_lock(self):
+        class NeverAcquire:
+            def __enter__(self):
+                raise AssertionError("health must not acquire the backfill lock")
+
+            def __exit__(self, *args):
+                pass
+
+        with patch.object(qmt, "_BACKFILL_LOCK", NeverAcquire()):
+            payload = self.health()
+        self.assertEqual(payload["backfill"], {"pending": 0, "running": 0})
+
     def test_health_empty_and_unknown_facts_are_not_inferred(self):
         qmt._WS_CLIENTS.clear()
         payload = self.health()
@@ -523,26 +535,30 @@ class UniverseProtocolTest(unittest.TestCase):
         ])
 
     def test_ioloop_lag_sample_uses_monotonic_and_retains_only_60_seconds(self):
-        qmt._IOLOOP_NEXT_TICK = 101
+        qmt._IOLOOP_LAST_TICK = 100
         with patch.object(qmt, "monotonic", side_effect=[101, 104.5, 105, 165.1]):
             qmt.sample_ioloop_lag()
             self.assertEqual(qmt._IOLOOP_LAG_SAMPLES[-1][1], 0)
             qmt.sample_ioloop_lag()
             self.assertEqual(qmt._IOLOOP_LAG_SAMPLES[-1][1], 2500)
             qmt.sample_ioloop_lag()
-            self.assertEqual(qmt._IOLOOP_LAG_SAMPLES[-1][1], 0)  # Skipped-period catch-up is not negative.
-            self.assertEqual(self.health(now=105)["ioloop_lag_ms"], {"latest": 0, "max_60s": 2500})
+            self.assertEqual(qmt._IOLOOP_LAG_SAMPLES[-1][1], -500)
+            self.assertEqual(self.health(now=105)["ioloop_lag_ms"], {"latest": -500, "max_60s": 2500})
             qmt.sample_ioloop_lag()
         self.assertEqual(len(qmt._IOLOOP_LAG_SAMPLES), 1)
-        self.assertAlmostEqual(qmt._IOLOOP_LAG_SAMPLES[0][1], 59100)
+        self.assertAlmostEqual(qmt._IOLOOP_LAG_SAMPLES[-1][1], 59100)
 
-    def test_ioloop_lag_measures_repeated_lateness_against_scheduled_deadlines(self):
-        qmt._IOLOOP_NEXT_TICK = 101
-        with patch.object(qmt, "monotonic", side_effect=[101.5, 102.5]):
-            qmt.sample_ioloop_lag()
-            qmt.sample_ioloop_lag()
-        self.assertEqual(list(qmt._IOLOOP_LAG_SAMPLES), [(101.5, 500), (102.5, 500)])
-        self.assertEqual(qmt._IOLOOP_NEXT_TICK, 103)
+    def test_ioloop_lag_uses_actual_intervals_and_preserves_negative_observations(self):
+        qmt._IOLOOP_LAST_TICK = 0
+        with patch.object(qmt, "monotonic", side_effect=[1.2, 2.3, 5.8, 6.3]):
+            for _ in range(4):
+                qmt.sample_ioloop_lag()
+            lags = [sample[1] for sample in qmt._IOLOOP_LAG_SAMPLES]
+        self.assertAlmostEqual(lags[0], 200)
+        self.assertAlmostEqual(lags[1], 100)
+        self.assertAlmostEqual(lags[2], 2500)
+        self.assertAlmostEqual(lags[3], -500)
+        self.assertEqual(qmt._IOLOOP_LAST_TICK, 6.3)
 
     def test_health_rolling_max_filters_old_samples_without_mutating_them(self):
         qmt._IOLOOP_LAG_SAMPLES.extend([(39, 9000), (40, 500), (99, 1)])

@@ -60,7 +60,7 @@ _REALTIME_RELEASE_AT = {}
 _REALTIME_PUSHER = None
 _ACCOUNT_PUSHER = None
 _HEALTH_SAMPLER = None
-_IOLOOP_NEXT_TICK = None
+_IOLOOP_LAST_TICK = None
 _IOLOOP_LAG_SAMPLES = deque()
 _REALTIME_LAST_PUSH_AT = None
 _REALTIME_PUSHED_SYMBOL_COUNT = 0
@@ -2227,15 +2227,11 @@ class CancelByRuleHandler(BaseHandler):
             raise HTTPError(500, f"撤单失败: {str(e)}")
 
 def sample_ioloop_lag():
-    global _IOLOOP_NEXT_TICK
+    global _IOLOOP_LAST_TICK
     now = monotonic()
-    if _IOLOOP_NEXT_TICK is not None:
-        lag_ms = max(0.0, (now - _IOLOOP_NEXT_TICK) * 1000)
-        _IOLOOP_LAG_SAMPLES.append((now, lag_ms))
-        # PeriodicCallback skips missed deadlines rather than shifting its schedule.
-        _IOLOOP_NEXT_TICK += max(1, int(now - _IOLOOP_NEXT_TICK) + 1)
-    else:
-        _IOLOOP_NEXT_TICK = now + 1
+    if _IOLOOP_LAST_TICK is not None:
+        _IOLOOP_LAG_SAMPLES.append((now, (now - _IOLOOP_LAST_TICK - 1.0) * 1000))
+    _IOLOOP_LAST_TICK = now
     while _IOLOOP_LAG_SAMPLES and _IOLOOP_LAG_SAMPLES[0][0] < now - 60:
         _IOLOOP_LAG_SAMPLES.popleft()
 
@@ -2253,9 +2249,9 @@ class HealthHandler(BaseHandler):
              "expires_at": client["expires_at"]}
             for owner, client in _UNIVERSE_CLIENTS.items() if client["expires"] is not None
         )
-        with _BACKFILL_LOCK:
-            backfill = {"pending": len(_BACKFILL_PENDING), "running": len(_BACKFILL_RUNNING)}
-            universe_size = len(_UNIVERSE_SUBSCRIBED)
+        # Avoid waiting on the backfill lock, which may be held during disk I/O.
+        backfill = {"pending": len(_BACKFILL_PENDING), "running": len(_BACKFILL_RUNNING)}
+        universe_size = len(_UNIVERSE_SUBSCRIBED)
         self.write(json.dumps({
             "bridge_id": _BRIDGE_ID,
             "started_at": _STARTED_AT,
@@ -2497,7 +2493,7 @@ def _shutdown_server(reason="stop"):
 
 def init(ContextInfo):
     global _APP, _SERVER, _IOLOOP, _STOPPING, _REALTIME_PUSHER, _ACCOUNT_PUSHER
-    global _HEALTH_SAMPLER, _IOLOOP_NEXT_TICK
+    global _HEALTH_SAMPLER, _IOLOOP_LAST_TICK
     loop = None
     try:
         for callback in (_REALTIME_PUSHER, _ACCOUNT_PUSHER, _HEALTH_SAMPLER):
@@ -2527,7 +2523,7 @@ def init(ContextInfo):
         start_backfill_worker()
         _IOLOOP_LAG_SAMPLES.clear()
         _HEALTH_SAMPLER = PeriodicCallback(sample_ioloop_lag, 1000)
-        _IOLOOP_NEXT_TICK = monotonic() + 1
+        _IOLOOP_LAST_TICK = monotonic()
         _HEALTH_SAMPLER.start()
         _REALTIME_PUSHER = PeriodicCallback(push_global_market_data, 1000)
         _REALTIME_PUSHER.start()
