@@ -235,7 +235,7 @@ class UniverseProtocolTest(unittest.TestCase):
             clock.now.return_value = now
             request = self.request_body(symbols=["600000.sh", "000001.SZ", "920001.BJ", "600000.SH"],
                                         start_time="20261026000000", end_time="20261026000000")
-            self.assertEqual(qmt.validate_backfill_request(request)[0], ["000001.SZ", "600000.SH", "920001.BJ"])
+            self.assertEqual(qmt.validate_backfill_request(request)[0], sorted(set(symbol.upper() for symbol in request["symbols"])))
             for changes in ({"symbols": []}, {"symbols": "600000.SH"}, {"symbols": [None]},
                             {"symbols": ["A.SH"]}, {"symbols": ["000300.SH"]},
                             {"symbols": ["510300.SH"]}, {"symbols": ["399001.SZ"]}, {"period": "1d"},
