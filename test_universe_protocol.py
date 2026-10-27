@@ -373,6 +373,100 @@ class UniverseProtocolTest(unittest.TestCase):
         return {"client_id": client, "symbols": symbols, "period": period,
                 "start_time": start, "end_time": end}
 
+    def test_configure_only_changes_realtime_scope_and_preserves_selected_streams(self):
+        self.configure(self.client, {"600000.SH": True, "000001.SZ": False}, streams=["account", "deal"])
+        self.client.handle_subscribe({"stocks": "000001.SZ"})
+        self.client.handle_unsubscribe({"stocks": "000001.SZ"})
+        self.assertEqual(self.client.streams, {"account", "deal"})
+        self.assertFalse(qmt._DOWNLOADS)
+        self.assertFalse(qmt._DOWNLOAD_JOBS)
+        self.assertFalse(qmt._DOWNLOAD_QUEUE)
+
+    def test_websocket_rejects_nonfinite_and_invalid_unicode_before_mutating_scope(self):
+        for extra in ({"client_id": "\ud800"}, {"unused": float("nan")}):
+            self.client.on_message(json.dumps({"action": "configure", "universe": [], **extra}))
+            self.assertEqual(self.client.sent[-1]["type"], "error")
+            self.assertFalse(qmt._UNIVERSE_CLIENTS)
+        self.ctx.subscribe_quote.assert_not_called()
+
+    def test_download_global_and_client_limits_do_not_block_other_clients_or_duplicates(self):
+        with patch.object(qmt, "_DOWNLOAD_LIMIT", 3), patch.object(qmt, "_DOWNLOAD_CLIENT_LIMIT", 2):
+            for symbol in ("600000.SH", "600001.SH"):
+                self.handler(qmt.DownloadHandler, self.download_body("a", [symbol])).post()
+            first_id = next(iter(qmt._DOWNLOADS))
+            duplicate = self.handler(qmt.DownloadHandler, self.download_body("a", ["600000.SH"]))
+            duplicate.post()
+            self.assertEqual(json.loads(duplicate.write.call_args.args[0])["id"], first_id)
+            with self.assertRaises(qmt.HTTPError) as caught:
+                self.handler(qmt.DownloadHandler, self.download_body("a", ["600002.SH"])).post()
+            self.assertEqual(caught.exception.status_code, 429)
+            self.assertIn("client", caught.exception.log_message)
+            self.handler(qmt.DownloadHandler, self.download_body("b", ["600002.SH"])).post()
+            with self.assertRaises(qmt.HTTPError) as caught:
+                self.handler(qmt.DownloadHandler, self.download_body("c", ["600003.SH"])).post()
+            self.assertEqual(caught.exception.status_code, 429)
+            self.assertIn("global", caught.exception.log_message)
+            self.assertEqual(len(qmt._DOWNLOADS), 3)
+
+    def test_completed_download_retention_evicts_jobs_and_queues_but_not_active_requests(self):
+        active = self.handler(qmt.DownloadHandler, self.download_body("active", ["000001.SZ", "000002.SZ"]))
+        active.post()
+        active_id = json.loads(active.write.call_args.args[0])["id"]
+        with patch.object(qmt, "_DOWNLOAD_COMPLETED_LIMIT", 2), patch.dict(qmt.__dict__, {"download_history_data2": Mock()}):
+            for index in range(4):
+                handler = self.handler(qmt.DownloadHandler, self.download_body("other", ["60000%s.SH" % index]))
+                handler.post()
+                request_id = json.loads(handler.write.call_args.args[0])["id"]
+                qmt.run_download(qmt._DOWNLOADS[request_id]["jobs"][0])
+            self.assertEqual(len(qmt._DOWNLOADS), 3)
+            self.assertIn(active_id, qmt._DOWNLOADS)
+            self.assertEqual(len(qmt._DOWNLOAD_JOBS), 4)
+            self.assertEqual(list(qmt._DOWNLOAD_QUEUE), ["active"])
+            self.assertEqual(len(qmt._DOWNLOAD_QUEUE["active"]), 1)
+            for job in list(qmt._DOWNLOADS[active_id]["jobs"]):
+                qmt.run_download(job)
+            self.assertEqual(len(qmt._DOWNLOADS), 2)
+            self.assertIn(active_id, qmt._DOWNLOADS)
+            self.assertEqual(qmt._DOWNLOADS[active_id]["status"], "success")
+            self.assertFalse(qmt._DOWNLOAD_QUEUE)
+
+    def test_download_has_no_300_symbol_limit_and_grace_expiry_does_not_cancel_work(self):
+        symbols = ["%06d.SH" % index for index in range(301)]
+        self.assertEqual(len(qmt.validate_download(self.download_body("a", symbols))[1]), 301)
+        self.configure(self.client, {"600000.SH": True})
+        self.handler(qmt.DownloadHandler, self.download_body("first", ["600000.SH"])).post()
+        job = qmt.take_download()
+        health = self.handler(qmt.HealthHandler, {})
+        health.get()
+        client = next(row for row in json.loads(health.write.call_args.args[0])["clients"] if row["client_id"] == "first")
+        self.assertEqual((client["state"], client["realtime"], client["subscription_count"], client["running"]), ("connected", 1, 2, 1))
+        with patch.object(qmt, "monotonic", return_value=1000):
+            self.client.on_close()
+        with patch.object(qmt, "monotonic", return_value=1121):
+            qmt.push_global_market_data()
+        self.assertNotIn("first", qmt._UNIVERSE_CLIENTS)
+        with patch.dict(qmt.__dict__, {"download_history_data2": Mock()}):
+            qmt.run_download(job)
+        self.assertEqual(next(iter(qmt._DOWNLOADS.values()))["status"], "success")
+
+    def test_websocket_write_buffers_release_on_failure_and_reject_slow_connections(self):
+        from concurrent.futures import Future
+        client = self.client
+        client.ws_connection = object()
+        client.write_message = Mock(side_effect=RuntimeError("write failed"))
+        send = qmt.MarketWebSocketHandler.send_json
+        self.assertFalse(send(client, {"type": "bar"}))
+        self.assertEqual(client.write_buffer_bytes, 0)
+        pending = Future()
+        client.write_message = Mock(return_value=pending)
+        self.assertTrue(send(client, {"type": "bar", "data": {"close": float("nan")}}))
+        self.assertGreater(client.write_buffer_bytes, 0)
+        pending.set_exception(RuntimeError("socket closed"))
+        self.assertEqual(client.write_buffer_bytes, 0)
+        with patch.object(qmt, "_WRITE_LIMIT", 1):
+            self.assertFalse(send(client, {"type": "bar"}))
+        client.close.assert_called_once()
+
     def test_download_deduplicates_cross_clients_returns_correlated_status_and_lists(self):
         handler_a = self.handler(qmt.DownloadHandler, self.download_body("a", ["600000.SH", "000001.SZ"]))
         handler_a.get_argument = Mock(return_value="a")

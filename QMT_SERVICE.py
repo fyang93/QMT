@@ -272,7 +272,9 @@ def set_client_universe(owner, universe, connection=None):
         own = sum(universe.values())
         current = sum(_UNIVERSE_CLIENTS.get(owner, {}).get("universe", {}).values())
         raise ValueError("realtime limit=%s global_occupied=%s client_occupied=%s client_requested=%s combined_requested=%s (including grace)" % (
-            _QMT_REALTIME_SYMBOL_LIMIT, len({stock for stock, period in _REALTIME_SUBSCRIPTIONS}), current, own, len(occupied)))
+            _QMT_REALTIME_SYMBOL_LIMIT,
+            len({stock for stock, period in _REALTIME_SUBSCRIPTIONS} | {stock for stock, enabled in _UNIVERSE_SUBSCRIBED.items() if enabled}),
+            current, own, len(occupied)))
     previous = _UNIVERSE_CLIENTS.get(owner, {}).get("connection")
     _UNIVERSE_CLIENTS.clear()
     _UNIVERSE_CLIENTS.update(clients)
@@ -366,7 +368,8 @@ def _push_global_market_data():
 
 def update_downloads():
     # Called under _DOWNLOAD_LOCK; job outcomes are shared across callers.
-    for request in _DOWNLOADS.values():
+    finished = []
+    for request_id, request in _DOWNLOADS.items():
         jobs = request["jobs"]
         previous_status = request["status"]
         if previous_status in ("success", "failed"):
@@ -381,6 +384,9 @@ def update_downloads():
             request["updated_at"] = datetime.now(timezone.utc).isoformat()
         if new_status in ("success", "failed"):
             request["finished_at"] = request["updated_at"]
+            finished.append(request_id)
+    for request_id in finished:
+        _DOWNLOADS.move_to_end(request_id)
     completed = [key for key, value in _DOWNLOADS.items() if value["status"] in ("success", "failed")]
     for key in completed[:-_DOWNLOAD_COMPLETED_LIMIT]:
         del _DOWNLOADS[key]
@@ -622,6 +628,7 @@ class MarketWebSocketHandler(WebSocketHandler):
             data = json.loads(message)
             if not isinstance(data, dict) or not isinstance(data.get("action", "ping"), str):
                 raise ValueError("message must be a JSON object with a string action")
+            validate_body(data)
             action = data.get("action", "ping")
             if action == "ping":
                 self.send_json({"type": "pong"})
@@ -694,7 +701,7 @@ class MarketWebSocketHandler(WebSocketHandler):
             return
         universe = dict(self.universe)
         universe.update({stock.upper(): True for stock in stocks})
-        self.handle_configure({"client_id": self.client_id, "universe": [
+        self.handle_configure({"client_id": self.client_id, "streams": sorted(self.streams), "universe": [
             {"symbol": stock, "subscribed": subscribed} for stock, subscribed in universe.items()
         ]})
 
@@ -702,7 +709,7 @@ class MarketWebSocketHandler(WebSocketHandler):
         stocks = set(parse_list(data.get("stock_code", data.get("stocks", ""))))
         sub_ids = set(parse_list(data.get("sub_id", data.get("sub_ids", ""))))
         stocks.update(stock for (stock, period), sub_id in _REALTIME_SUBSCRIPTIONS.items() if str(sub_id) in sub_ids)
-        self.handle_configure({"client_id": self.client_id, "universe": [
+        self.handle_configure({"client_id": self.client_id, "streams": sorted(self.streams), "universe": [
             {"symbol": stock, "subscribed": enabled and stock not in stocks} for stock, enabled in self.universe.items()
         ]})
 
