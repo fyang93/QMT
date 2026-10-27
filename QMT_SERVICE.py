@@ -438,7 +438,11 @@ def run_download(job):
         status, error = "success", None
     except Exception as exc:
         logger.exception("QMT download failed")
-        status, error = "failed", str(exc)[:2000] or type(exc).__name__
+        status, error = "failed", type(exc).__name__
+        try:
+            error = str(exc)[:2000] or error
+        except Exception:
+            pass
     with _DOWNLOAD_LOCK:
         job.update(status=status, error=error)
         update_downloads()
@@ -446,12 +450,16 @@ def run_download(job):
 
 def download_worker():
     while not _DOWNLOAD_STOP.is_set():
-        job = take_download()
-        if job is None:
-            _DOWNLOAD_WAKE.wait(0.5)
-            _DOWNLOAD_WAKE.clear()
-            continue
-        run_download(job)
+        try:
+            job = take_download()
+            if job is None:
+                _DOWNLOAD_WAKE.wait(0.5)
+                _DOWNLOAD_WAKE.clear()
+                continue
+            run_download(job)
+        except Exception:
+            logger.exception("QMT download worker iteration failed")
+            _DOWNLOAD_STOP.wait(0.5)
 
 
 def start_download_worker():

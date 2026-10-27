@@ -510,6 +510,31 @@ class UniverseProtocolTest(unittest.TestCase):
         self.assertEqual(qmt._DOWNLOADS[cid]["status"], "failed")
         self.assertTrue(qmt._DOWNLOADS[bid]["finished_at"])
 
+    def test_worker_recovers_from_scheduler_fault_and_exception_with_broken_string(self):
+        class NativeError(Exception):
+            def __str__(self):
+                raise RuntimeError("broken exception rendering")
+        handler = self.handler(qmt.DownloadHandler, self.download_body("a", ["000001.SZ", "600000.SH"]))
+        handler.post()
+        take = qmt.take_download
+        faults = [True]
+        def recoverable_take():
+            if faults:
+                faults.pop()
+                raise OSError("temporary scheduler failure")
+            return take()
+        native = Mock(side_effect=[NativeError(), None])
+        with patch.object(qmt, "take_download", side_effect=recoverable_take), \
+                patch.dict(qmt.__dict__, {"download_history_data2": native}), \
+                patch.object(qmt._DOWNLOAD_STOP, "wait", return_value=False), \
+                patch.object(qmt._DOWNLOAD_WAKE, "wait", side_effect=lambda timeout: qmt._DOWNLOAD_STOP.set()):
+            qmt.download_worker()
+        self.assertEqual(native.call_count, 2)
+        request = next(iter(qmt._DOWNLOADS.values()))
+        self.assertEqual(request["status"], "failed")
+        self.assertEqual(request["error"], "NativeError")
+        self.assertEqual([job["status"] for job in request["jobs"]], ["failed", "success"])
+
     def test_download_validation_and_history_download_are_strict(self):
         for body in (
                 self.download_body("a", ["bad***"]),
