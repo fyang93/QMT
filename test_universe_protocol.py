@@ -328,6 +328,26 @@ class UniverseProtocolTest(unittest.TestCase):
         self.assertEqual(self.submit_request(symbols=["600999.SH"])["status"], "queued")
         self.assertEqual(len(qmt._BACKFILL_PENDING), 200)
 
+    def test_backfill_request_retains_200_completed_without_removing_active_requests(self):
+        completed = []
+        with patch.object(qmt, "download_history_range") as download, patch.object(qmt.logger, "exception"):
+            for index in range(202):
+                download.side_effect = RuntimeError("native failure") if index % 2 else None
+                completed.append(self.submit_request()["id"])
+                qmt.run_backfill_request(*qmt.take_backfill_request())
+        running = self.submit_request(symbols=["600001.SH"])
+        qmt.take_backfill_request()
+        queued = self.submit_request(symbols=["600002.SH"])
+        self.assertEqual(set(qmt._BACKFILL_REQUESTS), set(completed[-200:] + [running["id"], queued["id"]]))
+        self.assertEqual(self.poll_request(running["id"])["status"], "running")
+        self.assertEqual(self.poll_request(queued["id"])["status"], "queued")
+        self.assertEqual(self.poll_request(completed[-2])["status"], "success")
+        self.assertEqual(self.poll_request(completed[-1])["status"], "failed")
+        for request_id in completed[:2]:
+            with self.assertRaises(qmt.HTTPError) as error:
+                self.poll_request(request_id)
+            self.assertEqual(error.exception.args[0], 404)
+
     def test_backfill_request_downloads_any_symbol_count_on_worker_and_never_broadcasts(self):
         symbols = ["%06d.SH" % (600000 + index) for index in range(101)]
         payload = self.submit_request(symbols=symbols)

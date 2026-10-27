@@ -1258,6 +1258,10 @@ class BackfillRequestHandler(BaseHandler):
         except ValueError as exc:
             raise HTTPError(400, str(exc))
         with _BACKFILL_LOCK:
+            completed = [request_id for request_id, request in _BACKFILL_REQUESTS.items()
+                         if request["status"] in ("success", "failed")]
+            for request_id in completed[:-200]:
+                del _BACKFILL_REQUESTS[request_id]
             for request_id, request in _BACKFILL_REQUESTS.items():
                 if (request["status"] in ("queued", "running") and request["symbols"] == symbols
                         and request["period"] == period and request["start_time"] == start_time
