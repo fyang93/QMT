@@ -486,7 +486,45 @@ class UniverseProtocolTest(unittest.TestCase):
         listed.get()
         self.assertEqual(json.loads(listed.write.call_args.args[0])["requests"][0]["id"], payload_a["id"])
 
-    def test_download_queue_is_fair_and_one_native_typeerror_does_not_repeat(self):
+    def test_download_supports_each_native_api_and_legacy_signatures(self):
+        key = ("600000.SH", "1d", "20260101000000", "20260102150000")
+        for name in ("download_history_data2", "download_history_data"):
+            args = ([key[0]] if name.endswith("2") else key[0],) + key[1:]
+            for legacy in (False, True):
+                for result in (None, True, False, 0):
+                    with self.subTest(api=name, legacy=legacy, result=result):
+                        native = Mock(side_effect=[TypeError("unexpected keyword"), result] if legacy else [result])
+                        job = {"key": key}
+                        with patch.dict(qmt.__dict__, {name: native}):
+                            qmt.run_download(job)
+                        calls = [(args, {"incrementally": False})]
+                        if legacy:
+                            calls.append((args, {}))
+                        self.assertEqual(native.call_args_list, calls)
+                        self.assertEqual(job["status"], "failed" if result is False else "success")
+                        self.assertEqual(job["error"], name + " returned False" if result is False else None)
+
+    def test_download_prefers_data2_and_does_not_fallback_on_failure(self):
+        key = ("600000.SH", "1d", "20260101000000", "20260102150000")
+        for results in ([None], [False], [RuntimeError("native failure")], [TypeError("native failure")] * 2):
+            with self.subTest(results=results):
+                batch = Mock(side_effect=results)
+                single = Mock()
+                job = {"key": key}
+                with patch.dict(qmt.__dict__, {"download_history_data2": batch, "download_history_data": single}):
+                    qmt.run_download(job)
+                batch.assert_any_call([key[0]], *key[1:], incrementally=False)
+                single.assert_not_called()
+                self.assertEqual(job["status"], "success" if results == [None] else "failed")
+
+    def test_download_fails_when_both_native_apis_are_missing(self):
+        job = {"key": ("600000.SH", "1d", "20260101000000", "20260102150000")}
+        qmt.run_download(job)
+        self.assertEqual(job["status"], "failed")
+        self.assertIn("unavailable", job["error"])
+        self.assertIn("download_history_data2/download_history_data", job["error"])
+
+    def test_download_queue_is_fair_and_native_typeerror_retries_only_once(self):
         def submit(client, symbols):
             handler = self.handler(qmt.DownloadHandler, self.download_body(client, symbols))
             handler.post()
@@ -496,14 +534,14 @@ class UniverseProtocolTest(unittest.TestCase):
         cid = submit("C", ["600000.SH", "600002.SH"])
         events = []
         def native(symbols, period, start, end, **kwargs):
-            self.assertFalse(kwargs["incrementally"])
+            self.assertFalse(kwargs.get("incrementally", False))
             events.append(symbols[0])
             if symbols[0] == "600000.SH":
                 raise TypeError("inside native implementation")
             return True
         with patch.dict(qmt.__dict__, {"download_history_data2": native}), patch.object(qmt._DOWNLOAD_WAKE, "wait", side_effect=lambda timeout: qmt._DOWNLOAD_STOP.set()):
             qmt.download_worker()
-        self.assertEqual(events, ["600000.SH", "000001.SZ", "600002.SH", "600001.SH"])
+        self.assertEqual(events, ["600000.SH", "600000.SH", "000001.SZ", "600002.SH", "600001.SH"])
         self.assertEqual(qmt._DOWNLOADS[aid]["status"], "failed")
         self.assertIn("inside native implementation", qmt._DOWNLOADS[aid]["error"])
         self.assertEqual(qmt._DOWNLOADS[bid]["status"], "success")

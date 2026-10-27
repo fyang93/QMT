@@ -432,11 +432,20 @@ def run_download(job):
     try:
         symbol, period, start_time, end_time = job["key"]
         downloader = globals().get("download_history_data2")
+        target = [symbol]
+        name = "download_history_data2"
         if downloader is None:
-            raise RuntimeError("download_history_data2 is unavailable")
-        result = downloader([symbol], period, start_time, end_time, incrementally=False)
+            downloader = globals().get("download_history_data")
+            target = symbol
+            name = "download_history_data"
+        if downloader is None:
+            raise RuntimeError("download_history_data2/download_history_data is unavailable")
+        try:
+            result = downloader(target, period, start_time, end_time, incrementally=False)
+        except TypeError:
+            result = downloader(target, period, start_time, end_time)
         if result is False:
-            raise RuntimeError("download_history_data2 returned False")
+            raise RuntimeError("%s returned False" % name)
         status, error = "success", None
     except Exception as exc:
         logger.exception("QMT download failed")
