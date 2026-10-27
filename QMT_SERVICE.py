@@ -1,9 +1,9 @@
 # -*- coding: gbk -*-
 import json
 import locale
-import os
+from math import isfinite
 import re
-from collections import deque
+from collections import OrderedDict, deque
 from uuid import uuid4
 from datetime import datetime, timedelta, timezone
 from threading import Event, Lock, Thread
@@ -19,10 +19,6 @@ ACCOUNT_ID = "YOUR_QMT_ACCOUNT_ID"
 TOKEN = "YOUR_QMT_HTTP_TOKEN"
 PORT = 10086
 
-# 明确时间范围可修复本地缓存缺口；不要用空 start_time 触发“从最后一条开始”的隐式增量下载。
-BACKFILL_PERIOD_DAYS = {"1d": 180, "5m": 180, "1m": 10}
-_BACKGROUND_BACKFILL_PERIODS = ("1d", "5m")
-INCREMENTAL_INTERVAL_SECONDS = 300
 _QMT_FIELDS = ("open", "high", "low", "close", "volume", "amount")
 _QMT_TIMEZONE = timezone(timedelta(hours=8))
 
@@ -37,25 +33,26 @@ _SERVER = None
 _IOLOOP = None
 _STOPPING = False
 _WS_CLIENTS = set()
-_BACKFILL_PENDING = set()
-_BACKFILL_RESULTS = {}
-_BACKFILL_RUNNING = set()
-_BACKFILL_REQUESTS = {}
-_BACKFILL_REQUEST_QUEUE = deque()
-_BACKFILL_REQUEST_PAIRS = set()
-_BACKFILL_LOCK = Lock()
-_BACKFILL_REQUEST_LIMIT = 50
-_BACKFILL_STOP = Event()
-_BACKFILL_THREAD = None
-_BACKFILL_NEXT_INCREMENTAL = 0.0
-_BACKFILL_LAST_INCREMENTAL_DATE = ""
+_DOWNLOADS = OrderedDict()
+_DOWNLOAD_JOBS = {}
+_DOWNLOAD_CLIENT_LIMIT = 10
+_DOWNLOAD_QUEUE = OrderedDict()
+_DOWNLOAD_LOCK = Lock()
+_DOWNLOAD_STOP = Event()
+_DOWNLOAD_WAKE = Event()
+_DOWNLOAD_THREAD = None
+_DOWNLOAD_LIMIT = 50
+_DOWNLOAD_COMPLETED_LIMIT = 200
 _UNIVERSE_SUBSCRIBED = {}
 _QMT_REALTIME_SYMBOL_LIMIT = 50
-_HISTORY_DOWNLOAD_BATCH_SIZE = 300
-_HISTORY_MANIFESTS = []
-_HISTORY_SEQUENCE = 0
-_HISTORY_CLIENT_ACKS = {}
-_HISTORY_MANIFEST_LIMIT = 128
+_CLIENT_LIMIT = 64
+_UNIVERSE_SYMBOL_LIMIT = 10000
+_MESSAGE_LIMIT = 1024 * 1024
+_WRITE_LIMIT = 2 * 1024 * 1024
+_BROADCAST_LIMIT = 256
+_BROADCAST_QUEUE = deque()
+_BROADCAST_LOCK = Lock()
+_BROADCAST_SCHEDULED = False
 _BRIDGE_ID = uuid4().hex
 _STARTED_AT = datetime.now(timezone.utc).isoformat()
 _UNIVERSE_CLIENTS = {}
@@ -65,45 +62,113 @@ _REALTIME_PUSHER = None
 _ACCOUNT_PUSHER = None
 _HEALTH_SAMPLER = None
 _IOLOOP_LAST_TICK = None
-_IOLOOP_LAG_SAMPLES = deque()
+_IOLOOP_LAG_SAMPLES = deque(maxlen=120)
 _REALTIME_LAST_PUSH_AT = None
 _REALTIME_PUSHED_SYMBOL_COUNT = 0
 _REALTIME_LAST_5M = 0.0
 _DISCONNECT_GRACE_SECONDS = 120
-# Some QMT editors omit __file__; the compiled model filename is a fallback at startup.
-_SCRIPT_PATH = globals().get("__file__")
-_BACKFILL_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(_SCRIPT_PATH)), "QMT_SERVICE_backfill.json") if _SCRIPT_PATH else None
+# Universe and sockets are IOLoop-confined; native callbacks and downloads use their own locks.
 
 
 def safe_call(func, *args, **kwargs):
     try:
         return func(*args, **kwargs)
     except Exception as e:
-        logger.error(f"{func.__name__} 调用失败: {e}")
+        logger.error("QMT call failed: %s", e)
         return None
 
 
 def parse_bool(value, default=False):
-    if value is None:
-        return default
     if isinstance(value, bool):
         return value
-    return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
+    if isinstance(value, (str, int)) and str(value).lower() in ("1", "true", "yes", "y", "on"):
+        return True
+    if isinstance(value, (str, int)) and str(value).lower() in ("0", "false", "no", "n", "off"):
+        return False
+    raise HTTPError(400, "expected a boolean")
 
 
 def parse_list(value):
-    if value is None:
-        return []
-    if isinstance(value, (list, tuple)):
-        return [str(v).strip() for v in value if str(v).strip()]
-    return [v.strip() for v in str(value).split(",") if v.strip()]
+    if isinstance(value, str):
+        value = value.split(",")
+    if not isinstance(value, (list, tuple)) or any(not isinstance(item, str) for item in value):
+        raise HTTPError(400, "expected a comma-separated string or list of strings")
+    return [item.strip() for item in value if item.strip()]
+
+
+def number(value, field):
+    try:
+        if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+            raise ValueError()
+        result = float(value)
+        if not isfinite(result):
+            raise ValueError()
+    except (TypeError, ValueError, OverflowError):
+        raise HTTPError(400, "%s must be a finite number" % field)
+    if field == "price" and result < 0 and result != -1:
+        raise HTTPError(400, "price must be non-negative or the native -1 sentinel")
+    if field in ("volume", "amount") and result <= 0:
+        raise HTTPError(400, "%s must be positive" % field)
+    if field in ("sigma", "strikePrice", "optionPrice", "days", "minAmountPerOrder") and result < 0:
+        raise HTTPError(400, "%s must be non-negative" % field)
+    return result
+
+
+def integer(value, field):
+    result = number(value, field)
+    if not result.is_integer():
+        raise HTTPError(400, "%s must be an integer" % field)
+    if field in ("count", "len") and result < -1:
+        raise HTTPError(400, "%s must be -1 or non-negative" % field)
+    if isinstance(value, int) or isinstance(value, str) and re.fullmatch(r"[+-]?[0-9]+", value.strip()):
+        return int(value)
+    return int(result)
+
+
+def validate_client_id(value):
+    if not isinstance(value, str) or not value.strip() or len(value) > 1024 or any(ord(char) < 32 for char in value):
+        raise HTTPError(400, "client_id must be a non-empty string of at most 1024 characters")
+
+
+def validate_body(data):
+    lists = {"fields", "field", "fieldList", "stockList", "stock_list", "stocks", "stock_code", "symbols", "objectPrices"}
+    text = {"stock", "stockcode", "stockCode", "period", "start_time", "end_time", "startTime", "endTime",
+            "start_date", "end_date", "startDate", "endDate", "account", "accountType", "accId", "accid",
+            "sector", "sectorname", "industry", "indexcode", "contractcode", "strdate", "dividend_type",
+            "dividendType", "divid_type", "format", "codemarket", "optioncode", "undl_code_ref",
+            "tabname", "colname", "market", "code", "report_type", "data_name", "undl_code", "dedate",
+            "opttype", "optionType", "strategyName", "userOrderId", "smartAlgoType", "style",
+            "datatype", "extdataname", "factorname", "industryType", "client_id"}
+    for key, value in data.items():
+        if key in lists and key != "objectPrices":
+            parse_list(value)
+        elif key in text and not isinstance(value, str):
+            raise HTTPError(400, "%s must be a string" % key)
+        elif key == "userOrderParam" and not isinstance(value, dict):
+            raise HTTPError(400, "userOrderParam must be an object")
+    pending = list(data.values())
+    while pending:
+        value = pending.pop()
+        if isinstance(value, str):
+            try:
+                value.encode("utf-8")
+            except UnicodeError:
+                raise HTTPError(400, "JSON strings must be valid Unicode")
+        elif isinstance(value, dict):
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
+        elif isinstance(value, float) and not isfinite(value):
+            raise HTTPError(400, "JSON numbers must be finite")
 
 
 def to_jsonable(value):
     if value is None:
         return None
     if hasattr(value, "to_dict"):
-        return value.to_dict()
+        return to_jsonable(value.to_dict())
+    if isinstance(value, float) and not isfinite(value):
+        return None
     if isinstance(value, dict):
         result = {}
         for k, v in value.items():
@@ -114,222 +179,72 @@ def to_jsonable(value):
     return value
 
 
-def backfill_range(period, start_time="", end_time=""):
-    now = datetime.now(_QMT_TIMEZONE)
-    days = BACKFILL_PERIOD_DAYS.get(period)
-    if days is None:
-        raise ValueError("background backfill only supports 1d, 5m, and 1m")
-    today = now.strftime("%Y%m%d")
-    session_close = today + "150000"
-    if start_time and len(str(start_time)) == 8:
-        start_time = str(start_time) + "000000"
-    if end_time and len(str(end_time)) == 8:
-        end_time = str(end_time) + "235959"
-    return (
-        start_time or (now - timedelta(days=days)).strftime("%Y%m%d%H%M%S"),
-        min(end_time or session_close, now.strftime("%Y%m%d%H%M%S"), session_close),
-    )
-
-
-def download_history_range(stocks, period, start_time, end_time):
-    stocks = parse_list(stocks)
-    downloader = globals().get("download_history_data2")
-    if downloader is not None:
-        try:
-            downloader(stocks, period, start_time, end_time, incrementally=True)
-        except TypeError:
-            downloader(stocks, period, start_time, end_time)
-        return
-    downloader = globals().get("download_history_data")
-    if downloader is None:
-        raise RuntimeError("download_history_data2/download_history_data not found")
-    for stock in stocks:
-        try:
-            downloader(stock, period, start_time, end_time, incrementally=True)
-        except TypeError:
-            downloader(stock, period, start_time, end_time)
-
-
-def trading_hours(now=None):
-    now = (now or datetime.now(_QMT_TIMEZONE)).astimezone(_QMT_TIMEZONE)
-    return now.weekday() < 5 and "0915" <= now.strftime("%H%M") <= "1505"
-
-
-def load_backfill_results():
-    if not _BACKFILL_STATE_PATH:
-        logger.warning("QMT script filename unavailable; backfill persistence disabled")
-        return
+def _queue_broadcast(payload, stream=None):
+    global _BROADCAST_SCHEDULED
     try:
-        with open(_BACKFILL_STATE_PATH, "r", encoding="utf-8") as stream:
-            results = json.load(stream)
-        if not isinstance(results, dict) or any(
-            not isinstance(key, str) or not isinstance(value, dict)
-            or value.get("status") != "success"
-            or not re.fullmatch(r"\d{14}", str(value.get("start_time", "")))
-            or not re.fullmatch(r"\d{14}", str(value.get("end_time", "")))
-            for key, value in results.items()
-        ):
-            raise ValueError("invalid backfill state")
-        _BACKFILL_RESULTS.update(results)
-        logger.info("QMT backfill state loaded: results=%s", len(results))
-    except FileNotFoundError:
-        pass
-    except (OSError, ValueError):
-        logger.exception("QMT backfill state unavailable; bounded repair required")
-
-
-def save_backfill_results():
-    if not _BACKFILL_STATE_PATH:
+        payload = to_jsonable(payload)
+        if len(json.dumps(payload, default=str, allow_nan=False).encode("utf-8")) > _MESSAGE_LIMIT:
+            logger.warning("QMT broadcast exceeds message limit; reread broker facts")
+            return
+    except Exception:
+        logger.exception("QMT broadcast serialization failed")
         return
-    # Called with _BACKFILL_LOCK held; atomic replacement also preserves the old file on failure.
-    temporary = _BACKFILL_STATE_PATH + ".tmp"
-    try:
-        with open(temporary, "w", encoding="utf-8") as stream:
-            json.dump({key: value for key, value in _BACKFILL_RESULTS.items() if value.get("status") == "success"}, stream)
-        os.replace(temporary, _BACKFILL_STATE_PATH)
-    except OSError:
-        logger.exception("QMT backfill state save failed")
-
-
-def _queue_broadcast(payload, *, history=False, factors=False):
     loop = _IOLOOP
     if loop is None:
         return
-    loop.add_callback(_broadcast, payload, history, factors)
+    with _BROADCAST_LOCK:
+        if len(_BROADCAST_QUEUE) >= _BROADCAST_LIMIT:
+            logger.warning("QMT broadcast queue full; clients must reread broker facts")
+            return
+        _BROADCAST_QUEUE.append((payload, stream))
+        if _BROADCAST_SCHEDULED:
+            return
+        _BROADCAST_SCHEDULED = True
+    try:
+        loop.add_callback(_drain_broadcasts)
+    except Exception:
+        with _BROADCAST_LOCK:
+            _BROADCAST_QUEUE.clear()
+            _BROADCAST_SCHEDULED = False
+        logger.exception("QMT broadcast scheduling failed")
 
 
-def _broadcast(payload, history=False, factors=False):
+def _drain_broadcasts():
+    global _BROADCAST_SCHEDULED
+    with _BROADCAST_LOCK:
+        pending = list(_BROADCAST_QUEUE)
+        _BROADCAST_QUEUE.clear()
+        _BROADCAST_SCHEDULED = False
+    for payload, stream in pending:
+        _broadcast(payload, stream)
+
+
+def _broadcast(payload, stream=None):
     for client in list(_WS_CLIENTS):
-        if history:
-            manifest = history_for_client(payload, client)
-            if manifest is not None:
-                client.send_json(manifest)
-            continue
-        if factors and not getattr(client, "wants_factors", False):
-            continue
-        client.send_json(payload)
-
-
-def history_for_client(manifest, client):
-    if not getattr(client, "wants_history", False):
-        return None
-    if _UNIVERSE_CLIENTS.get(client.client_id, {}).get("connection") is not client:
-        return None
-    if manifest["id"] in _HISTORY_CLIENT_ACKS.get(client.client_id, set()):
-        return None
-    stocks = [stock for stock in manifest["symbols"] if stock in client.universe]
-    return dict(manifest, symbols=stocks) if stocks else None
-
-
-def _announce_history(stocks, period, start_time, end_time, incremental):
-    global _HISTORY_SEQUENCE
-    # Factor synchronization uses the existing HTTP endpoint on the model thread,
-    # not redundant background ContextInfo calls or a large IOLoop callback.
-    stocks = sorted(set(stocks))
-    with _BACKFILL_LOCK:
-        matching = [item for item in _HISTORY_MANIFESTS if item["period"] == period and item["symbols"] == stocks]
-        for item in matching:
-            start_time = min(start_time, item["start_time"])
-            end_time = max(end_time, item["end_time"])
-            incremental = incremental and item["incremental"]
-        _HISTORY_MANIFESTS[:] = [item for item in _HISTORY_MANIFESTS if item not in matching]
-        # A long-lived bridge must not grow a merged repair beyond its retained window.
-        retained_start = datetime.strptime(end_time, "%Y%m%d%H%M%S") - timedelta(days=BACKFILL_PERIOD_DAYS[period])
-        start_time = max(start_time, retained_start.strftime("%Y%m%d%H%M%S"))
-        _HISTORY_SEQUENCE += 1
-        manifest = {
-            "type": "history_ready",
-            "bridge_id": _BRIDGE_ID,
-            "id": str(_HISTORY_SEQUENCE),
-            "period": period,
-            "symbols": stocks,
-            "start_time": start_time,
-            "end_time": end_time,
-            "incremental": incremental,
-            "count": -1,
-        }
-        _HISTORY_MANIFESTS.append(manifest)
-        if len(_HISTORY_MANIFESTS) > _HISTORY_MANIFEST_LIMIT:
-            # shortcut: keep bounded hints, reconstruct evicted full windows from download state on configure.
-            logger.warning("QMT history manifest limit reached; evicted hints will be rebuilt on configure")
-            del _HISTORY_MANIFESTS[:-_HISTORY_MANIFEST_LIMIT]
-        retained = {item["id"] for item in _HISTORY_MANIFESTS}
-        for acked in _HISTORY_CLIENT_ACKS.values():
-            acked.intersection_update(retained)
-    _queue_broadcast(manifest, history=True)
-
-
-def history_coverage(ctx, stock, period, start_time, end_time):
-    data = ctx.get_market_data_ex(
-        ["close"], [stock], period, start_time, end_time, -1, "none", False, False
-    )
-    frame = data.get(stock) if isinstance(data, dict) else None
-    if frame is None or len(frame) == 0:
-        raise RuntimeError("download completed but no local bars found")
-    index = list(frame.index)
-    return {"bars": len(frame), "first": str(index[0]), "last": str(index[-1])}
+        if stream is None or stream in getattr(client, "streams", set()):
+            safe_call(client.send_json, payload)
 
 
 def parse_universe(rows):
-    if not isinstance(rows, list):
-        raise ValueError("universe must be a list of {symbol, subscribed} objects")
+    if not isinstance(rows, list) or len(rows) > _UNIVERSE_SYMBOL_LIMIT:
+        raise ValueError("universe must be a list of at most %s {symbol, subscribed} objects" % _UNIVERSE_SYMBOL_LIMIT)
     desired = {}
     for row in rows:
         if not isinstance(row, dict) or set(row) != {"symbol", "subscribed"}:
             raise ValueError("each universe row must contain only symbol and subscribed")
         symbol = row["symbol"]
-        if not isinstance(symbol, str) or not symbol.strip() or type(row["subscribed"]) is not bool:
-            raise ValueError("universe symbol must be non-empty and subscribed must be boolean")
-        desired[symbol.upper().strip()] = row["subscribed"]
-    if sum(desired.values()) > _QMT_REALTIME_SYMBOL_LIMIT:
-        raise ValueError("universe exceeds the 50-symbol realtime subscription limit")
+        if not isinstance(symbol, str) or not re.fullmatch(r"[A-Za-z0-9_]+\.[A-Za-z0-9_]+", symbol) or len(symbol) > 64 or type(row["subscribed"]) is not bool:
+            raise ValueError("universe symbol must be a valid QMT code <=64 characters and subscribed must be boolean")
+        symbol = symbol.upper()
+        if symbol in desired:
+            raise ValueError("universe contains duplicate symbol: %s" % symbol)
+        desired[symbol] = row["subscribed"]
     return desired
 
 
-def set_universe_targets(desired, refresh=False):
-    queued = 0
-    reused = {}
-    with _BACKFILL_LOCK:
-        previous = dict(_UNIVERSE_SUBSCRIBED)
-        _UNIVERSE_SUBSCRIBED.clear()
-        _UNIVERSE_SUBSCRIBED.update(desired)
-        added = set(desired) if refresh else set(desired) - set(previous)
-        promoted = {stock for stock, subscribed in desired.items() if subscribed and not previous.get(stock, False)}
-        for stock in sorted(added | promoted, key=lambda symbol: (not desired[symbol], symbol)):
-            periods = (_BACKGROUND_BACKFILL_PERIODS if stock in added else ()) + (("1m",) if desired[stock] else ())
-            for period in periods:
-                if refresh:
-                    _BACKFILL_RESULTS.pop(stock + ":" + period, None)
-                item = (stock, period)
-                if not refresh and backfill_result_current(stock, period):
-                    reused.setdefault(period, []).append(stock)
-                    continue
-                if item not in _BACKFILL_PENDING and item not in _BACKFILL_RUNNING:
-                    _BACKFILL_PENDING.add(item)
-                    queued += 1
-        if refresh:
-            save_backfill_results()
-    for period, stocks in reused.items():
-        start_time, end_time = backfill_range(period)
-        _announce_history(stocks, period, start_time, end_time, False)
-    return queued
-
-
-def has_backfill_window(stock, period):
-    result = _BACKFILL_RESULTS.get(stock + ":" + period) or {}
-    start_time = backfill_range(period)[0]
-    return result.get("status") == "success" and str(result.get("start_time", "99999999999999")) <= start_time <= str(result.get("end_time", ""))
-
-
-def backfill_result_current(stock, period):
-    now = datetime.now(_QMT_TIMEZONE)
-    completed = now
-    if now.weekday() >= 5 or now.strftime("%H%M") < "1510":
-        completed -= timedelta(days=1)
-        while completed.weekday() >= 5:
-            completed -= timedelta(days=1)
-    result = _BACKFILL_RESULTS.get(stock + ":" + period) or {}
-    return has_backfill_window(stock, period) and str(result.get("end_time", "")) >= completed.strftime("%Y%m%d") + "150000"
+def set_universe_targets(desired):
+    _UNIVERSE_SUBSCRIBED.clear()
+    _UNIVERSE_SUBSCRIBED.update(desired)
 
 
 def merged_universe(clients):
@@ -340,7 +255,9 @@ def merged_universe(clients):
     return desired
 
 
-def set_client_universe(owner, universe, connection=None, refresh=False):
+def set_client_universe(owner, universe, connection=None):
+    if owner not in _UNIVERSE_CLIENTS and len(_UNIVERSE_CLIENTS) >= _CLIENT_LIMIT:
+        raise ValueError("configured client limit reached, including disconnect grace")
     clients = dict(_UNIVERSE_CLIENTS)
     clients[owner] = {
         "universe": dict(universe), "connection": connection, "expires": None,
@@ -348,42 +265,20 @@ def set_client_universe(owner, universe, connection=None, refresh=False):
         "expires_at": None,
     }
     desired = merged_universe(clients)
+    if len(desired) > _UNIVERSE_SYMBOL_LIMIT:
+        raise ValueError("combined universe exceeds symbol limit")
     occupied = {stock for stock, period in _REALTIME_SUBSCRIPTIONS} | {stock for stock, enabled in desired.items() if enabled}
     if len(occupied) > _QMT_REALTIME_SYMBOL_LIMIT:
-        raise ValueError("combined universe exceeds the 50-symbol realtime subscription limit (including unsubscribe/disconnect grace)")
-    previous_state = _UNIVERSE_CLIENTS.get(owner, {})
-    previous = previous_state.get("connection")
-    newly_needed = set(universe) - set(previous_state.get("universe", {}))
-    existing = set(_UNIVERSE_SUBSCRIBED)
+        own = sum(universe.values())
+        current = sum(_UNIVERSE_CLIENTS.get(owner, {}).get("universe", {}).values())
+        raise ValueError("realtime limit=%s global_occupied=%s client_occupied=%s client_requested=%s combined_requested=%s (including grace)" % (
+            _QMT_REALTIME_SYMBOL_LIMIT, len({stock for stock, period in _REALTIME_SUBSCRIPTIONS}), current, own, len(occupied)))
+    previous = _UNIVERSE_CLIENTS.get(owner, {}).get("connection")
     _UNIVERSE_CLIENTS.clear()
     _UNIVERSE_CLIENTS.update(clients)
+    set_universe_targets(desired)
     if previous is not None and previous is not connection:
-        previous.close(code=4000, reason="client_id reconnected")
-    queued = set_universe_targets(desired, refresh)
-    # An expanded client scope needs a new manifest ID even if it acked an earlier
-    # filtered view of the same archive. Reuse local data, not another download.
-    if not refresh:
-        with _BACKFILL_LOCK:
-            acked = _HISTORY_CLIENT_ACKS.get(owner, set())
-            expanded = {stock for item in _HISTORY_MANIFESTS if item["id"] in acked for stock in item["symbols"]} & newly_needed & existing
-        for period in _BACKGROUND_BACKFILL_PERIODS + ("1m",):
-            stocks = sorted(stock for stock in expanded if (period != "1m" or universe[stock]) and has_backfill_window(stock, period))
-            if stocks:
-                start_time, end_time = backfill_range(period)
-                _announce_history(stocks, period, start_time, end_time, False)
-    return queued
-
-
-def ensure_history_manifests(universe):
-    # Download completion and client persistence are independent. A restart or
-    # bounded manifest eviction must still expose the whole local retained window.
-    for period in _BACKGROUND_BACKFILL_PERIODS + ("1m",):
-        start_time, end_time = backfill_range(period)
-        with _BACKFILL_LOCK:
-            covered = {stock for item in _HISTORY_MANIFESTS if item["period"] == period and not item["incremental"] and item["start_time"] <= start_time for stock in item["symbols"]}
-            missing = sorted(stock for stock, enabled in universe.items() if (period != "1m" or enabled) and stock not in covered and has_backfill_window(stock, period))
-        for offset in range(0, len(missing), _HISTORY_DOWNLOAD_BATCH_SIZE):
-            _announce_history(missing[offset:offset + _HISTORY_DOWNLOAD_BATCH_SIZE], period, start_time, end_time, False)
+        safe_call(previous.close, code=4000, reason="client_id reconnected")
 
 
 def disconnect_universe_client(owner, connection):
@@ -399,8 +294,6 @@ def expire_universe_clients():
     expired = [owner for owner, client in _UNIVERSE_CLIENTS.items() if client["expires"] is not None and client["expires"] <= monotonic()]
     for owner in expired:
         del _UNIVERSE_CLIENTS[owner]
-        with _BACKFILL_LOCK:
-            _HISTORY_CLIENT_ACKS.pop(owner, None)
         logger.info("QMT client grace expired: client_id=%s", owner)
     if expired:
         set_universe_targets(merged_universe(_UNIVERSE_CLIENTS))
@@ -433,11 +326,19 @@ def refresh_global_subscriptions(ctx):
 
 
 def push_global_market_data():
+    safe_call(_push_global_market_data)
+
+
+def _push_global_market_data():
     global _REALTIME_LAST_5M, _REALTIME_LAST_PUSH_AT, _REALTIME_PUSHED_SYMBOL_COUNT
     pushed = set()
-    expire_universe_clients()
-    ctx = _APP.ContextInfo
-    refresh_global_subscriptions(ctx)
+    try:
+        expire_universe_clients()
+        ctx = _APP.ContextInfo
+        refresh_global_subscriptions(ctx)
+    except Exception:
+        logger.exception("QMT realtime subscription refresh failed")
+        return
     for period in ("1m", "5m"):
         if period == "5m":
             if monotonic() - _REALTIME_LAST_5M < 5:
@@ -455,7 +356,7 @@ def push_global_market_data():
                 continue
             selected = {stock: bars for stock, bars in data.items() if client.universe.get(stock, False)}
             if selected:
-                if client.send_json({"type": "bar", "period": period, "stocks": sorted(selected), "fields": list(_QMT_FIELDS), "count": 2, "data": selected}):
+                if safe_call(client.send_json, {"type": "bar", "period": period, "stocks": sorted(selected), "fields": list(_QMT_FIELDS), "count": 2, "data": selected}):
                     pushed.update(selected)
     if pushed:
         # These writes were queued, not acknowledged by the receiving clients.
@@ -463,154 +364,100 @@ def push_global_market_data():
         _REALTIME_PUSHED_SYMBOL_COUNT = len(pushed)
 
 
-def set_backfill_targets(stocks, refresh=False, owner="http"):
-    return set_client_universe(owner, {stock.upper(): False for stock in parse_list(stocks)}, refresh=refresh)
-
-
-def schedule_incremental_backfill():
-    global _BACKFILL_NEXT_INCREMENTAL, _BACKFILL_LAST_INCREMENTAL_DATE
-    now = datetime.now(_QMT_TIMEZONE)
-    today = now.strftime("%Y%m%d")
-    # ponytail: the close-time repair covers missed bars without competing with live subscriptions.
-    if now.weekday() >= 5 or now.strftime("%H%M") < "1510":
-        return
-    with _BACKFILL_LOCK:
-        if _BACKFILL_LAST_INCREMENTAL_DATE == today or _BACKFILL_PENDING or _BACKFILL_RUNNING or monotonic() < _BACKFILL_NEXT_INCREMENTAL:
-            return
-        missing = [
-            (stock, period)
-            for stock in sorted(_UNIVERSE_SUBSCRIBED)
-            for period in _BACKGROUND_BACKFILL_PERIODS + (("1m",) if _UNIVERSE_SUBSCRIBED[stock] else ())
-            if not backfill_result_current(stock, period)
-        ]
-        if not missing:
-            _BACKFILL_LAST_INCREMENTAL_DATE = today
-            return
-        _BACKFILL_PENDING.update(missing)
-        _BACKFILL_NEXT_INCREMENTAL = monotonic() + INCREMENTAL_INTERVAL_SECONDS
-        queued = len(_BACKFILL_PENDING)
-    if queued:
-        logger.info("QMT intraday incremental backfill queued: tasks=%s", queued)
-
-
-def take_backfill_batch():
-    with _BACKFILL_LOCK:
-        _BACKFILL_PENDING.intersection_update({
-            item for item in _BACKFILL_PENDING
-            if item[0] in _UNIVERSE_SUBSCRIBED and (item[1] != "1m" or _UNIVERSE_SUBSCRIBED[item[0]])
-        })
-        intraday = trading_hours()
-        eligible = [item for item in _BACKFILL_PENDING - _BACKFILL_RUNNING - _BACKFILL_REQUEST_PAIRS if not intraday or item[1] == "1m"]
-        if not eligible:
-            return []
-        eligible.sort(key=lambda item: ({"1d": 0, "1m": 1, "5m": 2}[item[1]], not _UNIVERSE_SUBSCRIBED[item[0]], item[0]))
-        period = eligible[0][1]
-        incremental = has_backfill_window(eligible[0][0], period)
-        batch = [item for item in eligible if item[1] == period and has_backfill_window(item[0], period) == incremental][:(10 if intraday else _HISTORY_DOWNLOAD_BATCH_SIZE)]
-        _BACKFILL_PENDING.difference_update(batch)
-        _BACKFILL_RUNNING.update(batch)
-        return batch
-
-
-def take_backfill_request():
-    with _BACKFILL_LOCK:
-        while _BACKFILL_REQUEST_QUEUE:
-            request_id = _BACKFILL_REQUEST_QUEUE.popleft()
-            request = _BACKFILL_REQUESTS.get(request_id)
-            if request and request["status"] == "queued":
-                _BACKFILL_RUNNING.update((symbol, request["period"]) for symbol in request["symbols"])
-                request["status"] = "running"
-                for result in request["results"].values():
-                    result["status"] = "running"
-                return request_id, request
-    return None
-
-
-def run_backfill_request(request_id, request):
-    try:
-        download_history_range(request["symbols"], request["period"], request["start_time"], request["end_time"])
-        with _BACKFILL_LOCK:
-            for result in request["results"].values():
-                result.update(status="success", error=None)
-            request["status"] = "success"
-    except Exception as exc:
-        logger.exception("QMT requested backfill failed: id=%s", request_id)
-        with _BACKFILL_LOCK:
-            for result in request["results"].values():
-                result.update(status="failed", error=str(exc))
-            request["status"] = "failed"
-    finally:
-        with _BACKFILL_LOCK:
-            pairs = {(symbol, request["period"]) for symbol in request["symbols"]}
-            _BACKFILL_RUNNING.difference_update(pairs)
-            _BACKFILL_REQUEST_PAIRS.difference_update(pairs)
-
-
-def backfill_worker():
-    while not _BACKFILL_STOP.is_set():
-        schedule_incremental_backfill()
-        request = take_backfill_request()
-        if request is not None:
-            run_backfill_request(*request)
+def update_downloads():
+    # Called under _DOWNLOAD_LOCK; job outcomes are shared across callers.
+    for request in _DOWNLOADS.values():
+        jobs = request["jobs"]
+        previous_status = request["status"]
+        if previous_status in ("success", "failed"):
             continue
-        batch = take_backfill_batch()
-        if not batch:
-            _BACKFILL_STOP.wait(0.5)
-            continue
-        period = batch[0][1]
-        stocks = sorted({item[0] for item in batch})
-        try:
-            start_time, end_time = backfill_range(period)
-            with _BACKFILL_LOCK:
-                previous = [_BACKFILL_RESULTS.get(stock + ":" + period) or {} for stock in stocks]
-            incremental = all(has_backfill_window(stock, period) for stock in stocks)
-            if incremental:
-                # Explicit overlap repairs partial bars; never ask QMT to infer an empty-start download.
-                earliest = min(datetime.strptime(result["end_time"], "%Y%m%d%H%M%S") for result in previous)
-                start_time = max(start_time, (earliest - timedelta(days=7)).strftime("%Y%m%d%H%M%S"))
-            logger.info(
-                "QMT history backfill started: %s symbols=%s mode=%s range=%s..%s",
-                period, len(stocks), "incremental" if incremental else "bounded", start_time, end_time,
-            )
-            # Recheck after selecting a batch: an opening boundary must defer archive downloads.
-            if trading_hours() and period != "1m":
-                with _BACKFILL_LOCK:
-                    _BACKFILL_PENDING.update(batch)
-                    _BACKFILL_RUNNING.difference_update(batch)
+        if all(job["status"] in ("success", "failed") for job in jobs):
+            errors = [job["error"] for job in jobs if job["status"] == "failed"]
+            request.update(status="failed" if errors else "success", error="; ".join(errors)[:2000] if errors else None)
+        elif any(job["status"] != "queued" for job in jobs):
+            request["status"] = "running"
+        new_status = request["status"]
+        if new_status != previous_status:
+            request["updated_at"] = datetime.now(timezone.utc).isoformat()
+        if new_status in ("success", "failed"):
+            request["finished_at"] = request["updated_at"]
+    completed = [key for key, value in _DOWNLOADS.items() if value["status"] in ("success", "failed")]
+    for key in completed[:-_DOWNLOAD_COMPLETED_LIMIT]:
+        del _DOWNLOADS[key]
+    retained = {id(job) for request in _DOWNLOADS.values() for job in request["jobs"]}
+    for key, job in list(_DOWNLOAD_JOBS.items()):
+        if id(job) not in retained:
+            del _DOWNLOAD_JOBS[key]
+    for owner, queue in list(_DOWNLOAD_QUEUE.items()):
+        queue = deque(key for key in queue if key in _DOWNLOADS and _DOWNLOADS[key]["status"] in ("queued", "running"))
+        if queue:
+            _DOWNLOAD_QUEUE[owner] = queue
+        else:
+            del _DOWNLOAD_QUEUE[owner]
+
+
+def take_download():
+    with _DOWNLOAD_LOCK:
+        for owner, queue in list(_DOWNLOAD_QUEUE.items()):
+            while queue and queue[0] not in _DOWNLOADS:
+                queue.popleft()
+            if not queue:
+                del _DOWNLOAD_QUEUE[owner]
                 continue
-            download_history_range(stocks, period, start_time, end_time)
-            _announce_history(stocks, period, start_time, end_time, incremental)
-            result = {"status": "success", "period": period, "trade_date": datetime.now(_QMT_TIMEZONE).strftime("%Y%m%d"), "start_time": start_time, "end_time": end_time, "mode": "incremental" if incremental else "bounded_incremental", "bars": None}
-            logger.info("QMT history backfill complete: %s symbols=%s mode=%s", period, len(stocks), result["mode"])
-            results = {stock + ":" + period: dict(result, **completed_download_range(old, start_time, end_time)) for stock, old in zip(stocks, previous)}
-        except Exception as e:
-            logger.exception("QMT history backfill failed: %s symbols=%s", period, len(stocks))
-            with _BACKFILL_LOCK:
-                results = {
-                    stock + ":" + period: dict(_BACKFILL_RESULTS[stock + ":" + period], last_error=str(e))
-                    if (_BACKFILL_RESULTS.get(stock + ":" + period) or {}).get("status") == "success"
-                    else {"status": "failed", "period": period, "error": str(e)}
-                    for stock in stocks
-                }
-        with _BACKFILL_LOCK:
-            _BACKFILL_RESULTS.update(results)
-            _BACKFILL_RUNNING.difference_update(batch)
-            save_backfill_results()
+            request = _DOWNLOADS[queue[0]]
+            job = next((job for job in request["jobs"] if job["status"] == "queued"), None)
+            if job is None:
+                queue.popleft()
+                if queue:
+                    _DOWNLOAD_QUEUE.move_to_end(owner)
+                else:
+                    del _DOWNLOAD_QUEUE[owner]
+                continue
+            _DOWNLOAD_QUEUE.move_to_end(owner)
+            job["status"] = "running"
+            update_downloads()
+            return job
+        return None
 
 
-def start_backfill_worker():
-    global _BACKFILL_THREAD, _BACKFILL_STATE_PATH
-    if _BACKFILL_THREAD and _BACKFILL_THREAD.is_alive():
-        return
-    if _BACKFILL_STATE_PATH is None:
-        filename = start_backfill_worker.__code__.co_filename
-        if filename and not filename.startswith("<"):
-            _BACKFILL_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(filename)), "QMT_SERVICE_backfill.json")
-    logger.info("QMT backfill state path: %s", _BACKFILL_STATE_PATH)
-    load_backfill_results()
-    _BACKFILL_STOP.clear()
-    _BACKFILL_THREAD = Thread(target=backfill_worker, name="qmt-history-backfill", daemon=True)
-    _BACKFILL_THREAD.start()
+def run_download(job):
+    try:
+        symbol, period, start_time, end_time = job["key"]
+        downloader = globals().get("download_history_data2")
+        if downloader is None:
+            raise RuntimeError("download_history_data2 is unavailable")
+        result = downloader([symbol], period, start_time, end_time, incrementally=False)
+        if result is False:
+            raise RuntimeError("download_history_data2 returned False")
+        status, error = "success", None
+    except Exception as exc:
+        logger.exception("QMT download failed")
+        status, error = "failed", str(exc)[:2000] or type(exc).__name__
+    with _DOWNLOAD_LOCK:
+        job.update(status=status, error=error)
+        update_downloads()
+
+
+def download_worker():
+    while not _DOWNLOAD_STOP.is_set():
+        job = take_download()
+        if job is None:
+            _DOWNLOAD_WAKE.wait(0.5)
+            _DOWNLOAD_WAKE.clear()
+            continue
+        run_download(job)
+
+
+def start_download_worker():
+    global _DOWNLOAD_THREAD
+    with _DOWNLOAD_LOCK:
+        if _DOWNLOAD_THREAD is not None and _DOWNLOAD_THREAD.is_alive():
+            if _DOWNLOAD_STOP.is_set():
+                raise RuntimeError("previous download is still stopping; restart after it finishes")
+            return
+        _DOWNLOAD_STOP.clear()
+        _DOWNLOAD_THREAD = Thread(target=download_worker, name="qmt-download", daemon=True)
+        _DOWNLOAD_THREAD.start()
 
 
 def _position_unrealized_pnl(position):
@@ -688,9 +535,9 @@ def account_status_payload():
 
 
 def push_account_status():
-    payload = account_status_payload()
+    payload = safe_call(account_status_payload)
     if payload is not None:
-        _broadcast({"type": "account_status", "data": payload})
+        _broadcast({"type": "account_status", "data": payload}, "account")
 
 
 # ============= BaseHandler =============
@@ -714,46 +561,23 @@ class BaseHandler(RequestHandler):
         self.set_header("Content-Type", "application/json; charset=utf-8")
 
     def write_error(self, status_code, **kwargs):
-        self.finish(json.dumps({
-            "error": self._reason,
-            "status_code": status_code
-        }, ensure_ascii=False))
+        error = self._reason if status_code < 500 else "internal bridge error"
+        exc = kwargs.get("exc_info", (None, None, None))[1]
+        if status_code < 500 and isinstance(exc, HTTPError) and exc.log_message:
+            error = exc.log_message % exc.args if exc.args else exc.log_message
+        self.finish(json.dumps({"error": error, "status_code": status_code}, ensure_ascii=False))
 
     def json_body(self):
         raw = self.request.body or b"{}"
-        if not raw:
-            return {}
+        if len(raw) > _MESSAGE_LIMIT:
+            raise HTTPError(400, "JSON body exceeds size limit")
         try:
-            text = raw.decode("utf-8")
-        except Exception:
-            text = raw.decode("gbk", "ignore")
-        text = text.strip()
-        if not text:
-            return {}
-
-        try:
-            data = json.loads(text)
-        except Exception:
-            fixed = text
-            fixed = re.sub(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:', r'\1"\2":', fixed)
-            if "'" in fixed and '"' not in fixed:
-                fixed = fixed.replace("'", '"')
-            try:
-                data = json.loads(fixed)
-            except Exception:
-                args = {}
-                for key in self.request.arguments:
-                    values = self.get_arguments(key)
-                    args[key] = values[-1] if values else ""
-                if args:
-                    return args
-                logger.warning("JSON body parse failed: %s", text[:300])
-                raise HTTPError(400, "请求体必须是合法JSON，例如 {\"stock_code\":\"600000.SH\"}")
-
-        if data is None:
-            return {}
+            data = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeError, RecursionError):
+            raise HTTPError(400, "body must be valid UTF-8 JSON")
         if not isinstance(data, dict):
-            raise HTTPError(400, "请求体JSON必须是对象")
+            raise HTTPError(400, "JSON body must be an object")
+        validate_body(data)
         return data
 
     def ctx(self):
@@ -767,8 +591,9 @@ class MarketWebSocketHandler(WebSocketHandler):
     def initialize(self):
         self.universe = {}
         self.client_id = "ws:%s" % id(self)
-        self.wants_history = False
-        self.wants_factors = False
+        self.configured = False
+        self.streams = set()
+        self.write_buffer_bytes = 0
 
     def check_origin(self, origin):
         return True
@@ -777,6 +602,9 @@ class MarketWebSocketHandler(WebSocketHandler):
         token = self.get_argument("token", None) or self.request.headers.get("X-Token")
         if token != TOKEN:
             self.close(code=4001, reason="认证失败：token 无效或缺失")
+            return
+        if len(_WS_CLIENTS) >= _CLIENT_LIMIT:
+            self.close(code=4002, reason="client limit reached")
             return
         _WS_CLIENTS.add(self)
         logger.info("QMT websocket opened: addr=%s client_id=%s symbols=0 global_symbols=%s global_realtime=%s", self.request.remote_ip, self.client_id, len(_UNIVERSE_SUBSCRIBED), sum(_UNIVERSE_SUBSCRIBED.values()))
@@ -789,40 +617,35 @@ class MarketWebSocketHandler(WebSocketHandler):
 
     def on_message(self, message):
         try:
+            if len(message) > _MESSAGE_LIMIT:
+                raise ValueError("message exceeds size limit")
             data = json.loads(message)
-        except Exception:
-            fixed = re.sub(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:', r'\1"\2":', message)
-            if "'" in fixed and '"' not in fixed:
-                fixed = fixed.replace("'", '"')
-            try:
-                data = json.loads(fixed)
-            except Exception:
-                self.send_json({"type": "error", "message": "message must be json object"})
-                return
-
-        if not isinstance(data, dict):
-            self.send_json({"type": "error", "message": "message must be json object"})
-            return
-        action = data.get("action", "ping")
-        if action == "ping":
-            self.send_json({"type": "pong"})
-        elif action in {"configure", "universe"}:
-            self.handle_configure(data)
-        elif action == "history_ack":
-            self.handle_history_ack(data)
-        elif action == "account_status":
-            push_account_status()
-        elif action == "subscribe":
-            self.handle_subscribe(data)
-        elif action == "unsubscribe":
-            self.handle_unsubscribe(data)
-        elif action == "subscriptions":
-            self.send_json({"type": "subscriptions", "subscriptions": [
-                {"stock_code": stock, "period": period, "sub_id": sub_id}
-                for (stock, period), sub_id in _REALTIME_SUBSCRIPTIONS.items() if self.universe.get(stock, False)
-            ]})
-        else:
-            self.send_json({"type": "error", "message": "unknown action: %s" % action})
+            if not isinstance(data, dict) or not isinstance(data.get("action", "ping"), str):
+                raise ValueError("message must be a JSON object with a string action")
+            action = data.get("action", "ping")
+            if action == "ping":
+                self.send_json({"type": "pong"})
+            elif action in ("configure", "universe"):
+                self.handle_configure(data)
+            elif action == "account_status":
+                payload = account_status_payload()
+                if payload is None:
+                    self.send_json({"type": "error", "message": "account status unavailable"})
+                else:
+                    self.send_json({"type": "account_status", "data": payload})
+            elif action == "subscribe":
+                self.handle_subscribe(data)
+            elif action == "unsubscribe":
+                self.handle_unsubscribe(data)
+            elif action == "subscriptions":
+                self.send_json({"type": "subscriptions", "subscriptions": [
+                    {"stock_code": stock, "period": period, "sub_id": sub_id}
+                    for (stock, period), sub_id in _REALTIME_SUBSCRIPTIONS.items() if self.universe.get(stock, False)
+                ]})
+            else:
+                raise ValueError("unknown action: %s" % action)
+        except Exception as exc:
+            self.send_json({"type": "error", "message": str(exc)})
 
     def handle_configure(self, data):
         try:
@@ -830,48 +653,35 @@ class MarketWebSocketHandler(WebSocketHandler):
             client_id = data.get("client_id", self.client_id)
             if not isinstance(client_id, str) or not client_id.strip() or len(client_id) > 1024 or any(ord(char) < 32 for char in client_id):
                 raise ValueError("client_id must be a non-empty string of at most 1024 characters")
-            if self.wants_history and client_id != self.client_id:
+            if self.configured and client_id != self.client_id:
                 raise ValueError("client_id cannot change on a configured connection")
-            queued = set_client_universe(client_id, universe, self, refresh=parse_bool(data.get("refresh_history")))
+            streams = data.get("streams", [])
+            if not isinstance(streams, list) or any(not isinstance(item, str) or item not in ("account", "order", "deal") for item in streams):
+                raise ValueError("streams must be a list containing account, order and/or deal")
+            set_client_universe(client_id, universe, self)
+            streams = set(streams)
         except ValueError as exc:
             self.send_json({"type": "error", "message": str(exc)})
             return
         self.client_id = client_id
         self.universe = universe
-        self.wants_history = True
-        self.wants_factors = True
-        ensure_history_manifests(self.universe)
+        self.configured = True
+        self.streams = streams
         logger.info(
-            "QMT universe configured: symbols=%s realtime=%s backfill_tasks=%s addr=%s client_id=%s global_symbols=%s global_realtime=%s clients=%s",
-            len(self.universe), sum(self.universe.values()), queued, self.request.remote_ip, self.client_id,
+            "QMT universe configured: symbols=%s realtime=%s addr=%s client_id=%s global_symbols=%s global_realtime=%s clients=%s",
+            len(self.universe), sum(self.universe.values()), self.request.remote_ip, self.client_id,
             len(_UNIVERSE_SUBSCRIBED), sum(_UNIVERSE_SUBSCRIBED.values()), len(_UNIVERSE_CLIENTS),
         )
         self.refresh_subscriptions()
         self.send_json({
             "type": "configured",
             "symbols": len(self.universe),
-            "queued": queued,
+            "streams": sorted(self.streams),
             "realtime": sum(self.universe.values()),
             "bridge_id": _BRIDGE_ID,
             "global_symbols": len(_UNIVERSE_SUBSCRIBED),
             "global_realtime": sum(_UNIVERSE_SUBSCRIBED.values()),
         })
-        with _BACKFILL_LOCK:
-            manifests = list(_HISTORY_MANIFESTS)
-        for manifest in manifests:
-            selected = history_for_client(manifest, self)
-            if selected is not None:
-                self.send_json(selected)
-
-    def handle_history_ack(self, data):
-        manifest_id = str(data.get("id", ""))
-        if data.get("bridge_id", _BRIDGE_ID) != _BRIDGE_ID:
-            self.send_json({"type": "error", "message": "history_ack bridge_id mismatch"})
-            return
-        with _BACKFILL_LOCK:
-            if any(item["id"] == manifest_id for item in _HISTORY_MANIFESTS):
-                _HISTORY_CLIENT_ACKS.setdefault(self.client_id, set()).add(manifest_id)
-        self.send_json({"type": "history_acked", "bridge_id": _BRIDGE_ID, "id": manifest_id})
 
     def refresh_subscriptions(self):
         refresh_global_subscriptions(self.application.ContextInfo)
@@ -900,20 +710,35 @@ class MarketWebSocketHandler(WebSocketHandler):
         if self.ws_connection is None:
             return False
         try:
-            future = self.write_message(json.dumps(data, ensure_ascii=False, default=str))
+            payload = json.dumps(to_jsonable(data), ensure_ascii=False, default=str, allow_nan=False)
+            size = len(payload.encode("utf-8"))
+            if self.write_buffer_bytes + size > _WRITE_LIMIT:
+                self.close(code=4003, reason="slow client write buffer limit")
+                return False
+            self.write_buffer_bytes += size
+            try:
+                future = self.write_message(payload)
+            except Exception:
+                self.write_buffer_bytes -= size
+                raise
             if future is not None:
-                future.add_done_callback(self._consume_write_result)
+                future.add_done_callback(lambda completed: self._consume_write_result(completed, size, self))
+            else:
+                self.write_buffer_bytes -= size
             return True
         except Exception as e:
             logger.debug("websocket write skipped: %s", e)
             return False
 
     @staticmethod
-    def _consume_write_result(future):
+    def _consume_write_result(future, size=0, client=None):
         try:
             future.result()
         except Exception:
             pass
+        finally:
+            if client is not None:
+                client.write_buffer_bytes = max(0, client.write_buffer_bytes - size)
 
 
 # ============= 1. ContextInfo 属性 =============
@@ -999,7 +824,7 @@ class LastVolumeHandler(BaseHandler):
 class BarTimetagHandler(BaseHandler):
     def post(self):
         data = self.json_body()
-        index = int(data.get('index', -1))
+        index = integer(data.get('index', -1), 'index')
         ret = safe_call(self.ctx().get_bar_timetag, index)
         self.write(json.dumps({"index": index, "timetag": ret}, ensure_ascii=False))
 
@@ -1062,7 +887,7 @@ class ContractMultiplierHandler(BaseHandler):
 class RiskFreeRateHandler(BaseHandler):
     def post(self):
         data = self.json_body()
-        index = int(data.get('index', '-1'))
+        index = integer(data.get('index', '-1'), 'index')
         ret = safe_call(self.ctx().get_risk_free_rate, index)
         self.write(json.dumps({"index": index, "risk_free_rate": ret}, ensure_ascii=False))
 
@@ -1073,53 +898,6 @@ class DateLocationHandler(BaseHandler):
         strdate = data.get('strdate', '')
         ret = safe_call(self.ctx().get_date_location, strdate)
         self.write(json.dumps({"strdate": strdate, "location": ret}, ensure_ascii=False))
-
-def completed_download_range(previous, start_time, end_time):
-    if previous.get("status") == "success" and previous.get("start_time", "99999999999999") <= end_time and start_time <= previous.get("end_time", ""):
-        start_time = min(start_time, previous["start_time"])
-        end_time = max(end_time, previous["end_time"])
-    return {"start_time": start_time, "end_time": end_time}
-
-
-def download_history_page(stocks, period, start_time, end_time):
-    # HTTP repairs share the worker's pair reservations and persisted range cache.
-    with _BACKFILL_LOCK:
-        needed = [stock for stock in stocks if not (
-            (_BACKFILL_RESULTS.get(stock + ":" + period) or {}).get("status") == "success"
-            and (_BACKFILL_RESULTS[stock + ":" + period].get("start_time") or "99999999999999") <= start_time
-            and _BACKFILL_RESULTS[stock + ":" + period]["end_time"] >= end_time
-        )]
-        batch = {(stock, period) for stock in needed}
-        if batch & (_BACKFILL_RUNNING | _BACKFILL_REQUEST_PAIRS):
-            raise HTTPError(503, "history download already queued or running; retry local reads later")
-        _BACKFILL_RUNNING.update(batch)
-        _BACKFILL_PENDING.difference_update(batch)
-        previous = [_BACKFILL_RESULTS.get(stock + ":" + period) or {} for stock in needed]
-        # Join an older cached range through the intervening gap, never claim
-        # continuous coverage by merely taking the min/max of disjoint downloads.
-        download_start = min([start_time] + [item["end_time"] for item in previous if item.get("status") == "success"])
-        download_end = max([end_time] + [item["start_time"] for item in previous if item.get("status") == "success"])
-    if not needed:
-        return
-    failed = False
-    try:
-        download_history_range(needed, period, download_start, download_end)
-        with _BACKFILL_LOCK:
-            for stock in needed:
-                previous = _BACKFILL_RESULTS.get(stock + ":" + period) or {}
-                _BACKFILL_RESULTS[stock + ":" + period] = dict(status="success", **completed_download_range(previous, download_start, download_end))
-            save_backfill_results()
-        _announce_history(needed, period, start_time, end_time, False)
-    except Exception:
-        failed = True
-        raise
-    finally:
-        with _BACKFILL_LOCK:
-            _BACKFILL_RUNNING.difference_update(batch)
-            # Release and retry atomically: a worker must never inherit our reservation
-            # between requeue and cleanup. Partial HTTP repairs still owe the archive.
-            _BACKFILL_PENDING.update(item for item in batch if item[0] in _UNIVERSE_SUBSCRIBED and (failed or not backfill_result_current(*item)))
-
 
 def validate_history_page(stocks, period, start_time, end_time, count):
     # Bound model-thread local reads too; clients page archives rather than monopolize the IOLoop.
@@ -1151,37 +929,21 @@ class HistoryDataHandler(BaseHandler):
         period = data.get('period', '1d')
         start_time = data.get('start_time', data.get('startTime', ''))
         end_time = data.get('end_time', data.get('endTime', ''))
-        count = int(data.get('count', data.get('len', '-1')))
+        count = integer(data.get('count', data.get('len', '-1')), 'count')
         dividend_type = data.get('dividend_type', data.get('dividendType', 'none'))
         fields = data.get('fields', data.get('field', 'open,high,low,close,volume'))
         fields_list = parse_list(fields)
-        do_download = parse_bool(data.get('download', True), True)
-        if do_download and trading_hours():
-            self.set_header("Retry-After", "60")
-            raise HTTPError(503, "history downloads are deferred during 09:15-15:05 Beijing weekdays; use download=false for local reads")
+        if parse_bool(data.get("download", False)):
+            raise HTTPError(400, "history_data is read-only; use POST /api/data/download")
         validate_history_page(stock_list, period, start_time, end_time, count)
-
-        download_results = {}
-        if do_download:
-            if period not in BACKFILL_PERIOD_DAYS:
-                raise HTTPError(400, "history download only supports 1d and 5m")
-            start_time, end_time = backfill_range(period, start_time, end_time)
-            if start_time > end_time:
-                raise HTTPError(400, "history download range has no elapsed bars")
-            try:
-                download_history_page(stock_list, period, start_time, end_time)
-                download_results = {stock: "success" for stock in stock_list}
-            except HTTPError:
-                raise
-            except Exception as e:
-                logger.exception("QMT history download failed")
-                raise HTTPError(502, "历史行情下载失败: %s" % e)
 
         try:
             ret = self.ctx().get_market_data_ex(
                 fields_list, stock_list, period, start_time, end_time, count,
                 dividend_type, False, False
             )
+        except HTTPError:
+            raise
         except Exception as e:
             logger.exception("QMT history read failed")
             raise HTTPError(500, "获取历史行情失败: %s" % e)
@@ -1191,124 +953,113 @@ class HistoryDataHandler(BaseHandler):
         self.write(json.dumps({
             "data": to_jsonable(ret),
             "source": "get_market_data_ex",
-            "download": download_results,
+            "download": {},
         }, ensure_ascii=False, default=str))
 
 
-class BackfillTargetsHandler(BaseHandler):
-    def put(self):
-        self.update_targets()
-
-    def post(self):
-        self.update_targets()
-
-    def update_targets(self):
-        data = self.json_body()
-        stocks = data.get('symbols', data.get('stock_code', data.get('stocks', '')))
-        queued = set_backfill_targets(stocks, parse_bool(data.get('refresh', False)), owner="http:" + self.request.remote_ip)
-        logger.info("QMT HTTP backfill configured: addr=%s symbols=%s global_symbols=%s global_realtime=%s queued=%s", self.request.remote_ip, len(parse_list(stocks)), len(_UNIVERSE_SUBSCRIBED), sum(_UNIVERSE_SUBSCRIBED.values()), queued)
-        self.set_status(202)
-        self.write(json.dumps({
-            "status": "accepted",
-            "symbols": len(parse_list(stocks)),
-            "queued": queued,
-        }, ensure_ascii=False))
-
-
-def validate_backfill_request(data):
-    symbols = data.get("symbols")
+def validate_download(data):
+    if set(data) != {"client_id", "symbols", "period", "start_time", "end_time"}:
+        raise HTTPError(400, "download requires only client_id, symbols, period, start_time and end_time")
+    client_id = data["client_id"]
+    validate_client_id(client_id)
+    symbols = data["symbols"]
     if not isinstance(symbols, list) or not symbols:
-        raise ValueError("symbols must be a non-empty list of CN stock codes")
-    stock_pattern = r"(?:(?:60|68)[0-9]{4}\.SH|(?:00|30)[0-9]{4}\.SZ|(?:[48][0-9]{5}|92[0-9]{4})\.BJ)"
-    if any(not isinstance(symbol, str) or not re.fullmatch(stock_pattern, symbol.upper()) for symbol in symbols):
-        raise ValueError("symbols must be CN stock codes such as 600000.SH")
-    symbols = sorted(set(symbol.upper() for symbol in symbols))
-    period = data.get("period")
-    if period not in ("1m", "5m"):
-        raise ValueError("period must be 1m or 5m")
-    start_time, end_time = data.get("start_time"), data.get("end_time")
+        raise HTTPError(400, "symbols must be a non-empty list")
+    if any(not isinstance(symbol, str) or not re.fullmatch(r"[A-Za-z0-9_]+\.[A-Za-z0-9_]+", symbol) or len(symbol) > 64 for symbol in symbols):
+        raise HTTPError(400, "symbols must be QMT codes such as 600000.SH")
+    period = data["period"]
+    if period not in ("1d", "5m", "1m"):
+        raise HTTPError(400, "period must be 1d, 5m or 1m")
+    start_time, end_time = data["start_time"], data["end_time"]
     try:
-        if not isinstance(start_time, str) or not re.fullmatch(r"[0-9]{14}", start_time):
-            raise ValueError
-        if not isinstance(end_time, str) or not re.fullmatch(r"[0-9]{14}", end_time):
-            raise ValueError
+        if any(not isinstance(value, str) or not re.fullmatch(r"[0-9]{14}", value) for value in (start_time, end_time)):
+            raise ValueError()
         start = datetime.strptime(start_time, "%Y%m%d%H%M%S")
         end = datetime.strptime(end_time, "%Y%m%d%H%M%S")
     except ValueError:
-        raise ValueError("start_time and end_time must be valid YYYYMMDDHHMMSS timestamps")
-    now = datetime.now(_QMT_TIMEZONE)
-    today = now.strftime("%Y%m%d")
-    if start.strftime("%Y%m%d") != today or end.strftime("%Y%m%d") != today or end < start:
-        raise ValueError("start_time and end_time must be an ordered range on Beijing today")
-    if end > now.replace(tzinfo=None):
-        raise ValueError("end_time must not be in the future")
-    return symbols, period, start_time, end_time
+        raise HTTPError(400, "start_time and end_time must be valid 14-digit YYYYMMDDHHMMSS timestamps")
+    if start > end:
+        raise HTTPError(400, "start_time must not exceed end_time")
+    if end > datetime.now(_QMT_TIMEZONE).replace(tzinfo=None):
+        raise HTTPError(400, "end_time must not be in the future (Beijing time)")
+    return client_id, sorted(set(symbol.upper() for symbol in symbols)), period, start_time, end_time
 
 
-def backfill_request_payload(request_id, request):
-    return {"id": request_id, "status": request["status"], "symbols": request["symbols"],
-            "period": request["period"], "start_time": request["start_time"],
-            "end_time": request["end_time"], "results": request["results"]}
+def download_payload(request_id, request):
+    payload = {key: request[key] for key in (
+        "client_id", "symbols", "period", "start_time", "end_time", "status", "error",
+        "created_at", "updated_at", "finished_at")}
+    payload.update(id=request_id, progress={
+        "total": len(request["jobs"]),
+        "completed": sum(job["status"] in ("success", "failed") for job in request["jobs"]),
+        "failed": sum(job["status"] == "failed" for job in request["jobs"]),
+    })
+    return payload
 
 
-class BackfillRequestHandler(BaseHandler):
+class DownloadHandler(BaseHandler):
     def post(self):
-        try:
-            symbols, period, start_time, end_time = validate_backfill_request(self.json_body())
-        except ValueError as exc:
-            raise HTTPError(400, str(exc))
-        with _BACKFILL_LOCK:
-            completed = [request_id for request_id, request in _BACKFILL_REQUESTS.items()
-                         if request["status"] in ("success", "failed")]
-            for request_id in completed[:-200]:
-                del _BACKFILL_REQUESTS[request_id]
-            for request_id, request in _BACKFILL_REQUESTS.items():
-                if (request["status"] in ("queued", "running") and request["symbols"] == symbols
-                        and request["period"] == period and request["start_time"] == start_time
-                        and request["end_time"] == end_time):
-                    self.set_status(202)
-                    self.write(json.dumps(backfill_request_payload(request_id, request), ensure_ascii=False))
-                    return
-            pairs = {(symbol, period) for symbol in symbols}
-            if pairs & (_BACKFILL_RUNNING | _BACKFILL_REQUEST_PAIRS):
-                raise HTTPError(409, "symbol/period already queued or running for another request; retry after completion")
-            active = sum(request["status"] in ("queued", "running") for request in _BACKFILL_REQUESTS.values())
-            if active >= _BACKFILL_REQUEST_LIMIT:
-                raise HTTPError(429, "backfill request queue is full")
-            request_id = uuid4().hex
-            request = {"status": "queued", "symbols": symbols, "period": period,
-                       "start_time": start_time, "end_time": end_time,
-                       "results": {symbol: {"status": "queued", "error": None} for symbol in symbols}}
-            _BACKFILL_REQUESTS[request_id] = request
-            _BACKFILL_REQUEST_QUEUE.append(request_id)
-            _BACKFILL_REQUEST_PAIRS.update(pairs)
-            payload = json.dumps(backfill_request_payload(request_id, request), ensure_ascii=False)
+        client_id, symbols, period, start_time, end_time = validate_download(self.json_body())
+        with _DOWNLOAD_LOCK:
+            for request_id, request in _DOWNLOADS.items():
+                if (request["client_id"] == client_id and request["status"] != "failed"
+                        and request["symbols"] == symbols and request["period"] == period
+                        and request["start_time"] == start_time and request["end_time"] == end_time):
+                    payload = download_payload(request_id, request)
+                    break
+            else:
+                active = [value for value in _DOWNLOADS.values() if value["status"] in ("queued", "running")]
+                if len(active) >= _DOWNLOAD_LIMIT:
+                    raise HTTPError(429, "global download queue limit reached (%s)" % _DOWNLOAD_LIMIT)
+                if sum(value["client_id"] == client_id for value in active) >= _DOWNLOAD_CLIENT_LIMIT:
+                    raise HTTPError(429, "client download queue limit reached (%s): %s" % (_DOWNLOAD_CLIENT_LIMIT, client_id))
+                jobs = []
+                for symbol in symbols:
+                    key = (symbol, period, start_time, end_time)
+                    job = _DOWNLOAD_JOBS.get(key)
+                    if job is None or job["status"] == "failed":
+                        job = {"key": key, "status": "queued", "error": None}
+                        _DOWNLOAD_JOBS[key] = job
+                    jobs.append(job)
+                request_id = uuid4().hex
+                request = {"client_id": client_id, "status": "queued", "symbols": symbols,
+                           "period": period, "start_time": start_time, "end_time": end_time,
+                           "error": None, "jobs": jobs,
+                           "created_at": datetime.now(timezone.utc).isoformat(),
+                           "updated_at": datetime.now(timezone.utc).isoformat(), "finished_at": None}
+                _DOWNLOADS[request_id] = request
+                _DOWNLOAD_QUEUE.setdefault(client_id, deque()).append(request_id)
+                update_downloads()
+                payload = download_payload(request_id, request)
+        _DOWNLOAD_WAKE.set()
         self.set_status(202)
-        self.write(payload)
+        self.write(json.dumps(payload, ensure_ascii=False))
 
     def get(self):
         request_id = self.get_argument("id", "")
-        with _BACKFILL_LOCK:
-            request = _BACKFILL_REQUESTS.get(request_id)
-            if request is None:
-                raise HTTPError(404, "backfill request not found")
-            payload = json.dumps(backfill_request_payload(request_id, request), ensure_ascii=False)
-        self.write(payload)
-
-
-class BackfillStatusHandler(BaseHandler):
-    def get(self):
-        with _BACKFILL_LOCK:
-            running = None
-            if _BACKFILL_RUNNING:
-                running = {"period": next(iter(_BACKFILL_RUNNING))[1], "symbols": len(_BACKFILL_RUNNING)}
-            payload = {
-                "targets": len(_UNIVERSE_SUBSCRIBED),
-                "pending": len(_BACKFILL_PENDING),
-                "running": running,
-                "results": dict(_BACKFILL_RESULTS),
-            }
+        client_id = self.get_argument("client_id", "")
+        if bool(request_id) == bool(client_id):
+            raise HTTPError(400, "provide exactly one of id or client_id")
+        with _DOWNLOAD_LOCK:
+            if client_id:
+                validate_client_id(client_id)
+                payload = {"client_id": client_id, "requests": [
+                    dict(id=key, client_id=value["client_id"], period=value["period"],
+                         start_time=value["start_time"], end_time=value["end_time"],
+                         status=value["status"], error=value["error"],
+                         created_at=value["created_at"], updated_at=value["updated_at"],
+                         finished_at=value["finished_at"], symbol_count=len(value["symbols"]),
+                         progress=download_payload(key, value)["progress"])
+                    for key, value in _DOWNLOADS.items() if value["client_id"] == client_id]}
+            else:
+                if not re.fullmatch(r"[0-9a-f]{32}", request_id):
+                    raise HTTPError(400, "id must be the download id returned by POST /api/data/download")
+                request = _DOWNLOADS.get(request_id)
+                if request is None:
+                    raise HTTPError(404, "download not found (expired or bridge restarted)")
+                payload = download_payload(request_id, request)
         self.write(json.dumps(payload, ensure_ascii=False))
+
 
 # ContextInfo.get_market_data() - 获取行情数据(DataFrame)
 class MarketDataHandler(BaseHandler):
@@ -1320,9 +1071,9 @@ class MarketDataHandler(BaseHandler):
         end_time = data.get('end_time', '')
         period = data.get('period', '1d')
         dividend_type = data.get('dividend_type', 'none')
-        count = int(data.get('count', '-1'))
-        fields_list = [f.strip() for f in fields.split(',')] if fields else []
-        stock_list = [s.strip() for s in stock_code.split(',')] if stock_code else []
+        count = integer(data.get('count', '-1'), 'count')
+        fields_list = parse_list(fields)
+        stock_list = parse_list(stock_code)
         ret = safe_call(self.ctx().get_market_data, fields_list, stock_list, start_time, end_time, True, period, dividend_type, count)
         if ret is None:
             raise HTTPError(500, "获取行情数据失败")
@@ -1339,11 +1090,11 @@ class MarketDataExHandler(BaseHandler):
         period = data.get('period', 'follow')
         start_time = data.get('start_time', '')
         end_time = data.get('end_time', '')
-        count = int(data.get('count', '-1'))
+        count = integer(data.get('count', '-1'), 'count')
         dividend_type = data.get('dividend_type', 'follow')
-        fields_list = [f.strip() for f in fields.split(',')] if fields else []
-        stock_list = [s.strip() for s in stock_code.split(',')] if stock_code else []
-        ret = safe_call(self.ctx().get_market_data_ex, fields_list, stock_list, period, start_time, end_time, count, dividend_type)
+        fields_list = parse_list(fields)
+        stock_list = parse_list(stock_code)
+        ret = safe_call(self.ctx().get_market_data_ex, fields_list, stock_list, period, start_time, end_time, count, dividend_type, False, False)
         if ret is None:
             raise HTTPError(500, "获取扩展行情失败")
         result = {}
@@ -1361,7 +1112,7 @@ class FullTickHandler(BaseHandler):
         stocks = data.get('stocks', '')
         if not stocks:
             raise HTTPError(400, "need args stocks")
-        code_list = [s.strip() for s in stocks.split(',')]
+        code_list = parse_list(stocks)
         ret = safe_call(self.ctx().get_full_tick, code_list)
         if not ret:
             raise HTTPError(500, "获取分笔行情失败")
@@ -1392,7 +1143,7 @@ class MainContractHandler(BaseHandler):
 class TimetagToDatetimeHandler(BaseHandler):
     def post(self):
         data = self.json_body()
-        timetag = int(data.get('timetag', '0'))
+        timetag = integer(data.get('timetag', '0'), 'timetag')
         fmt = data.get('format', '%Y-%m-%d %H:%M:%S')
         ret = safe_call(timetag_to_datetime, timetag, fmt)
         self.write(json.dumps({"timetag": timetag, "datetime": ret}, ensure_ascii=False))
@@ -1414,7 +1165,7 @@ class TradingDatesHandler(BaseHandler):
         end_date = data.get('end_date', '')
         count = data.get('count', '')
         period = data.get('period', '1d')
-        count_int = int(count) if count else -1
+        count_int = integer(count, 'count') if count != '' else -1
         ret = safe_call(self.ctx().get_trading_dates, stockcode, start_date, end_date, count_int, period)
         self.write(json.dumps({"dates": ret or []}, ensure_ascii=False))
 
@@ -1441,7 +1192,7 @@ class LonghubangHandler(BaseHandler):
         stock_list = data.get('stock_list', '')
         startTime = data.get('startTime', '')
         endTime = data.get('endTime', '')
-        slist = [s.strip() for s in stock_list.split(',')] if stock_list else []
+        slist = parse_list(stock_list)
         ret = safe_call(self.ctx().get_longhubang, slist, startTime, endTime)
         if hasattr(ret, 'to_dict'):
             ret = ret.to_dict()
@@ -1455,7 +1206,7 @@ class Top10ShareHolderHandler(BaseHandler):
         data_name = data.get('data_name', 'holder')
         start_time = data.get('start_time', '')
         end_time = data.get('end_time', '')
-        slist = [s.strip() for s in stock_list.split(',')] if stock_list else []
+        slist = parse_list(stock_list)
         ret = safe_call(get_top10_share_holder, slist, data_name, start_time, end_time)
         if hasattr(ret, 'to_dict'):
             ret = ret.to_dict()
@@ -1476,7 +1227,7 @@ class TurnoverRateHandler(BaseHandler):
         stock_list = data.get('stock_list', '')
         startTime = data.get('startTime', '')
         endTime = data.get('endTime', '')
-        slist = [s.strip() for s in stock_list.split(',')] if stock_list else []
+        slist = parse_list(stock_list)
         ret = safe_call(self.ctx().get_turnover_rate, slist, startTime, endTime)
         if hasattr(ret, 'to_dict'):
             ret = ret.to_dict()
@@ -1531,7 +1282,7 @@ class FinancialDataHandler(BaseHandler):
         market = data.get('market', '')
         code = data.get('code', '')
         report_type = data.get('report_type', 'report_time')
-        barpos = int(data.get('barpos', '-1'))
+        barpos = integer(data.get('barpos', '-1'), 'barpos')
         if tabname and colname and market and code:
             ret = safe_call(self.ctx().get_financial_data, tabname, colname, market, code, report_type, barpos)
         else:
@@ -1539,8 +1290,8 @@ class FinancialDataHandler(BaseHandler):
             stock_list = data.get('stockList', '')
             start_date = data.get('startDate', '')
             end_date = data.get('endDate', '')
-            fields = [f.strip() for f in field_list.split(',')] if field_list else []
-            stocks = [s.strip() for s in stock_list.split(',')] if stock_list else []
+            fields = parse_list(field_list)
+            stocks = parse_list(stock_list)
             rtype = data.get('report_type', 'announce_time')
             ret = safe_call(self.ctx().get_financial_data, fields, stocks, start_date, end_date, rtype)
         if hasattr(ret, 'to_dict'):
@@ -1556,11 +1307,11 @@ class FactorDataHandler(BaseHandler):
         stock_code = data.get('stockCode', '')
         start_date = data.get('startDate', '')
         end_date = data.get('endDate', '')
-        fields = [f.strip() for f in field_list.split(',')] if field_list else []
+        fields = parse_list(field_list)
         if stock_code:
             ret = safe_call(self.ctx().get_factor_data, fields, stock_code, start_date, end_date)
         else:
-            stocks = [s.strip() for s in stock_list.split(',')] if stock_list else []
+            stocks = parse_list(stock_list)
             ret = safe_call(self.ctx().get_factor_data, fields, stocks, start_date, end_date)
         if hasattr(ret, 'to_dict'):
             ret = ret.to_dict()
@@ -1595,7 +1346,7 @@ class OptionListHandler(BaseHandler):
         undl_code = data.get('undl_code', '')
         dedate = data.get('dedate', '')
         opttype = data.get('opttype', '')
-        isavailable = data.get('isavailable', 'true').lower() == 'true'
+        isavailable = parse_bool(data.get('isavailable', True))
         ret = safe_call(self.ctx().get_option_list, undl_code, dedate, opttype, isavailable)
         self.write(json.dumps({"option_list": ret or []}, ensure_ascii=False))
 
@@ -1621,15 +1372,16 @@ class BsmPriceHandler(BaseHandler):
         data = self.json_body()
         optionType = data.get('optionType', 'C')
         objectPrices = data.get('objectPrices', '')
-        strikePrice = float(data.get('strikePrice', '0'))
-        riskFree = float(data.get('riskFree', '0'))
-        sigma = float(data.get('sigma', '0'))
-        days = int(data.get('days', '0'))
-        dividend = float(data.get('dividend', '0'))
-        try:
-            op = float(objectPrices)
-        except ValueError:
-            op = [float(x) for x in objectPrices.split(',')]
+        strikePrice = number(data.get('strikePrice', '0'), 'strikePrice')
+        riskFree = number(data.get('riskFree', '0'), 'riskFree')
+        sigma = number(data.get('sigma', '0'), 'sigma')
+        days = integer(data.get('days', '0'), 'days')
+        dividend = number(data.get('dividend', '0'), 'dividend')
+        if isinstance(objectPrices, list) or isinstance(objectPrices, str) and ',' in objectPrices:
+            values = objectPrices if isinstance(objectPrices, list) else objectPrices.split(',')
+            op = [number(value, 'objectPrices') for value in values]
+        else:
+            op = number(objectPrices, 'objectPrices')
         ret = safe_call(self.ctx().bsm_price, optionType, op, strikePrice, riskFree, sigma, days, dividend)
         self.write(json.dumps({"price": ret}, ensure_ascii=False, default=str))
 
@@ -1638,12 +1390,12 @@ class BsmIvHandler(BaseHandler):
     def post(self):
         data = self.json_body()
         optionType = data.get('optionType', 'C')
-        objectPrices = float(data.get('objectPrices', '0'))
-        strikePrice = float(data.get('strikePrice', '0'))
-        optionPrice = float(data.get('optionPrice', '0'))
-        riskFree = float(data.get('riskFree', '0'))
-        days = int(data.get('days', '0'))
-        dividend = float(data.get('dividend', '0'))
+        objectPrices = number(data.get('objectPrices', '0'), 'objectPrices')
+        strikePrice = number(data.get('strikePrice', '0'), 'strikePrice')
+        optionPrice = number(data.get('optionPrice', '0'), 'optionPrice')
+        riskFree = number(data.get('riskFree', '0'), 'riskFree')
+        days = integer(data.get('days', '0'), 'days')
+        dividend = number(data.get('dividend', '0'), 'dividend')
         ret = safe_call(self.ctx().bsm_iv, optionType, objectPrices, strikePrice, optionPrice, riskFree, days, dividend)
         self.write(json.dumps({"iv": ret}, ensure_ascii=False))
 
@@ -1656,7 +1408,7 @@ class LocalDataHandler(BaseHandler):
         end_time = data.get('end_time', '')
         period = data.get('period', '1d')
         divid_type = data.get('divid_type', 'none')
-        count = int(data.get('count', '-1'))
+        count = integer(data.get('count', '-1'), 'count')
         ret = safe_call(self.ctx().get_local_data, stock_code, start_time, end_time, period, divid_type, count)
         if ret is None:
             raise HTTPError(500, "获取本地行情失败")
@@ -1708,7 +1460,7 @@ class IsSectorStockHandler(BaseHandler):
 class IsTypedStockHandler(BaseHandler):
     def post(self):
         data = self.json_body()
-        stocktypenum = int(data.get('stocktypenum', '0'))
+        stocktypenum = integer(data.get('stocktypenum', '0'), 'stocktypenum')
         market = data.get('market', '')
         stockcode = data.get('stockcode', '')
         ret = safe_call(is_typed_stock, stocktypenum, market, stockcode)
@@ -1730,13 +1482,13 @@ class PassorderHandler(BaseHandler):
     def post(self):
         try:
             data = self.json_body()
-            opType = int(data['opType'])
-            orderType = int(data.get('orderType', 1101))
+            opType = integer(data['opType'], 'opType')
+            orderType = integer(data.get('orderType', 1101), 'orderType')
             stock = data['stock']
-            pr_type = int(data.get('prType', 11))
-            price = float(data['price'])
-            volume = int(data['volume'])
-            quickTrade = int(data.get('quickTrade', 2))
+            pr_type = integer(data.get('prType', 11), 'prType')
+            price = number(data['price'], 'price')
+            volume = number(data['volume'], 'volume')
+            quickTrade = integer(data.get('quickTrade', 2), 'quickTrade')
             user_order_id = str(data.get('userOrderId', '')).strip()
             order_ref = passorder(opType, orderType, self.acc(), stock, pr_type, price, volume, 'qmt', quickTrade, user_order_id, self.ctx())
             self.write(json.dumps({
@@ -1745,6 +1497,8 @@ class PassorderHandler(BaseHandler):
                 "stock": stock,
                 "order_ref": str(order_ref) if order_ref else "unknown"
             }, ensure_ascii=False))
+        except HTTPError:
+            raise
         except Exception as e:
             logger.exception("passorder下单异常")
             raise HTTPError(400, f"下单失败: {str(e)}")
@@ -1755,14 +1509,16 @@ class AlgoPassorderHandler(BaseHandler):
         try:
             data = self.json_body()
             order_ref = algo_passorder(
-                int(data['opType']), int(data.get('orderType', 1101)),
-                self.acc(), data['stock'], int(data.get('prType', -1)),
-                float(data['price']), int(data['volume']),
-                data.get('strategyName', ''), int(data.get('quickTrade', 2)),
+                integer(data['opType'], 'opType'), integer(data.get('orderType', 1101), 'orderType'),
+                self.acc(), data['stock'], integer(data.get('prType', -1), 'prType'),
+                number(data['price'], 'price'), number(data['volume'], 'volume'),
+                data.get('strategyName', ''), integer(data.get('quickTrade', 2), 'quickTrade'),
                 data.get('userOrderId', ''), data.get('userOrderParam', {}),
                 self.ctx()
             )
             self.write(json.dumps({"status": "success", "order_ref": str(order_ref) if order_ref else "unknown"}, ensure_ascii=False))
+        except HTTPError:
+            raise
         except Exception as e:
             logger.exception("algo_passorder异常")
             raise HTTPError(400, f"算法下单失败: {str(e)}")
@@ -1773,15 +1529,17 @@ class SmartAlgoPassorderHandler(BaseHandler):
         try:
             data = self.json_body()
             order_ref = smart_algo_passorder(
-                int(data['opType']), int(data.get('orderType', 1101)),
-                self.acc(), data['stock'], int(data.get('prType', -1)),
-                float(data['price']), int(data['volume']),
-                data['smartAlgoType'], int(data.get('limitOverRate', 0)),
-                int(data.get('minAmountPerOrder', 0)),
+                integer(data['opType'], 'opType'), integer(data.get('orderType', 1101), 'orderType'),
+                self.acc(), data['stock'], integer(data.get('prType', -1), 'prType'),
+                number(data['price'], 'price'), number(data['volume'], 'volume'),
+                data['smartAlgoType'], integer(data.get('limitOverRate', 0), 'limitOverRate'),
+                integer(data.get('minAmountPerOrder', 0), 'minAmountPerOrder'),
                 data.get('startTime', ''), data.get('endTime', ''),
                 self.ctx()
             )
             self.write(json.dumps({"status": "success", "order_ref": str(order_ref) if order_ref else "unknown"}, ensure_ascii=False))
+        except HTTPError:
+            raise
         except Exception as e:
             logger.exception("smart_algo_passorder异常")
             raise HTTPError(400, f"智能算法下单失败: {str(e)}")
@@ -1791,9 +1549,11 @@ class OrderLotsHandler(BaseHandler):
     def post(self):
         try:
             data = self.json_body()
-            order_lots(data['stock'], int(data['lots']), data.get('style', 'LATEST'),
-                       float(data.get('price', 0)), self.ctx(), data.get('accId', self.acc()))
+            order_lots(data['stock'], integer(data['lots'], 'lots'), data.get('style', 'LATEST'),
+                       number(data.get('price', 0), 'price'), self.ctx(), data.get('accId', self.acc()))
             self.write(json.dumps({"status": "success", "action": "order_lots", "stock": data['stock']}, ensure_ascii=False))
+        except HTTPError:
+            raise
         except Exception as e:
             logger.exception("order_lots异常")
             raise HTTPError(400, f"下单失败: {str(e)}")
@@ -1803,9 +1563,11 @@ class OrderValueHandler(BaseHandler):
     def post(self):
         try:
             data = self.json_body()
-            order_value(data['stock'], float(data['value']), data.get('style', 'LATEST'),
-                        float(data.get('price', 0)), self.ctx(), data.get('accId', self.acc()))
+            order_value(data['stock'], number(data['value'], 'value'), data.get('style', 'LATEST'),
+                        number(data.get('price', 0), 'price'), self.ctx(), data.get('accId', self.acc()))
             self.write(json.dumps({"status": "success", "action": "order_value", "stock": data['stock']}, ensure_ascii=False))
+        except HTTPError:
+            raise
         except Exception as e:
             logger.exception("order_value异常")
             raise HTTPError(400, f"下单失败: {str(e)}")
@@ -1815,9 +1577,11 @@ class OrderPercentHandler(BaseHandler):
     def post(self):
         try:
             data = self.json_body()
-            order_percent(data['stock'], float(data['percent']), data.get('style', 'LATEST'),
-                          float(data.get('price', 0)), self.ctx(), data.get('accId', self.acc()))
+            order_percent(data['stock'], number(data['percent'], 'percent'), data.get('style', 'LATEST'),
+                          number(data.get('price', 0), 'price'), self.ctx(), data.get('accId', self.acc()))
             self.write(json.dumps({"status": "success", "action": "order_percent", "stock": data['stock']}, ensure_ascii=False))
+        except HTTPError:
+            raise
         except Exception as e:
             logger.exception("order_percent异常")
             raise HTTPError(400, f"下单失败: {str(e)}")
@@ -1827,9 +1591,11 @@ class OrderTargetValueHandler(BaseHandler):
     def post(self):
         try:
             data = self.json_body()
-            order_target_value(data['stock'], float(data['tar_value']), data.get('style', 'LATEST'),
-                               float(data.get('price', 0)), self.ctx(), data.get('accId', self.acc()))
+            order_target_value(data['stock'], number(data['tar_value'], 'tar_value'), data.get('style', 'LATEST'),
+                               number(data.get('price', 0), 'price'), self.ctx(), data.get('accId', self.acc()))
             self.write(json.dumps({"status": "success", "action": "order_target_value", "stock": data['stock']}, ensure_ascii=False))
+        except HTTPError:
+            raise
         except Exception as e:
             logger.exception("order_target_value异常")
             raise HTTPError(400, f"下单失败: {str(e)}")
@@ -1839,9 +1605,11 @@ class OrderTargetPercentHandler(BaseHandler):
     def post(self):
         try:
             data = self.json_body()
-            order_target_percent(data['stock'], float(data['tar_percent']), data.get('style', 'LATEST'),
-                                 float(data.get('price', 0)), self.ctx(), data.get('accId', self.acc()))
+            order_target_percent(data['stock'], number(data['tar_percent'], 'tar_percent'), data.get('style', 'LATEST'),
+                                 number(data.get('price', 0), 'price'), self.ctx(), data.get('accId', self.acc()))
             self.write(json.dumps({"status": "success", "action": "order_target_percent", "stock": data['stock']}, ensure_ascii=False))
+        except HTTPError:
+            raise
         except Exception as e:
             logger.exception("order_target_percent异常")
             raise HTTPError(400, f"下单失败: {str(e)}")
@@ -1851,9 +1619,11 @@ class OrderSharesHandler(BaseHandler):
     def post(self):
         try:
             data = self.json_body()
-            order_shares(data['stock'], int(data['shares']), data.get('style', 'LATEST'),
-                         float(data.get('price', 0)), self.ctx(), data.get('accId', self.acc()))
+            order_shares(data['stock'], integer(data['shares'], 'shares'), data.get('style', 'LATEST'),
+                         number(data.get('price', 0), 'price'), self.ctx(), data.get('accId', self.acc()))
             self.write(json.dumps({"status": "success", "action": "order_shares", "stock": data['stock']}, ensure_ascii=False))
+        except HTTPError:
+            raise
         except Exception as e:
             logger.exception("order_shares异常")
             raise HTTPError(400, f"下单失败: {str(e)}")
@@ -1865,9 +1635,11 @@ class FuturesBuyOpenHandler(BaseHandler):
     def post(self):
         try:
             data = self.json_body()
-            buy_open(data['stock'], int(data['amount']), data.get('style', 'LATEST'),
-                     float(data.get('price', 0)), self.ctx(), data.get('accId', self.acc()))
+            buy_open(data['stock'], integer(data['amount'], 'amount'), data.get('style', 'LATEST'),
+                     number(data.get('price', 0), 'price'), self.ctx(), data.get('accId', self.acc()))
             self.write(json.dumps({"status": "success", "action": "buy_open", "stock": data['stock']}, ensure_ascii=False))
+        except HTTPError:
+            raise
         except Exception as e:
             logger.exception("buy_open异常")
             raise HTTPError(400, f"期货买入开仓失败: {str(e)}")
@@ -1877,9 +1649,11 @@ class FuturesBuyCloseTdayFirstHandler(BaseHandler):
     def post(self):
         try:
             data = self.json_body()
-            buy_close_tdayfirst(data['stock'], int(data['amount']), data.get('style', 'LATEST'),
-                                float(data.get('price', 0)), self.ctx(), data.get('accId', self.acc()))
+            buy_close_tdayfirst(data['stock'], integer(data['amount'], 'amount'), data.get('style', 'LATEST'),
+                                number(data.get('price', 0), 'price'), self.ctx(), data.get('accId', self.acc()))
             self.write(json.dumps({"status": "success", "action": "buy_close_tdayfirst", "stock": data['stock']}, ensure_ascii=False))
+        except HTTPError:
+            raise
         except Exception as e:
             logger.exception("buy_close_tdayfirst异常")
             raise HTTPError(400, f"期货买入平仓(平今)失败: {str(e)}")
@@ -1889,9 +1663,11 @@ class FuturesBuyCloseYdayFirstHandler(BaseHandler):
     def post(self):
         try:
             data = self.json_body()
-            buy_close_ydayfirst(data['stock'], int(data['amount']), data.get('style', 'LATEST'),
-                                float(data.get('price', 0)), self.ctx(), data.get('accId', self.acc()))
+            buy_close_ydayfirst(data['stock'], integer(data['amount'], 'amount'), data.get('style', 'LATEST'),
+                                number(data.get('price', 0), 'price'), self.ctx(), data.get('accId', self.acc()))
             self.write(json.dumps({"status": "success", "action": "buy_close_ydayfirst", "stock": data['stock']}, ensure_ascii=False))
+        except HTTPError:
+            raise
         except Exception as e:
             logger.exception("buy_close_ydayfirst异常")
             raise HTTPError(400, f"期货买入平仓(平昨)失败: {str(e)}")
@@ -1901,9 +1677,11 @@ class FuturesSellOpenHandler(BaseHandler):
     def post(self):
         try:
             data = self.json_body()
-            sell_open(data['stock'], int(data['amount']), data.get('style', 'LATEST'),
-                      float(data.get('price', 0)), self.ctx(), data.get('accId', self.acc()))
+            sell_open(data['stock'], integer(data['amount'], 'amount'), data.get('style', 'LATEST'),
+                      number(data.get('price', 0), 'price'), self.ctx(), data.get('accId', self.acc()))
             self.write(json.dumps({"status": "success", "action": "sell_open", "stock": data['stock']}, ensure_ascii=False))
+        except HTTPError:
+            raise
         except Exception as e:
             logger.exception("sell_open异常")
             raise HTTPError(400, f"期货卖出开仓失败: {str(e)}")
@@ -1913,9 +1691,11 @@ class FuturesSellCloseTdayFirstHandler(BaseHandler):
     def post(self):
         try:
             data = self.json_body()
-            sell_close_tdayfirst(data['stock'], int(data['amount']), data.get('style', 'LATEST'),
-                                 float(data.get('price', 0)), self.ctx(), data.get('accId', self.acc()))
+            sell_close_tdayfirst(data['stock'], integer(data['amount'], 'amount'), data.get('style', 'LATEST'),
+                                 number(data.get('price', 0), 'price'), self.ctx(), data.get('accId', self.acc()))
             self.write(json.dumps({"status": "success", "action": "sell_close_tdayfirst", "stock": data['stock']}, ensure_ascii=False))
+        except HTTPError:
+            raise
         except Exception as e:
             logger.exception("sell_close_tdayfirst异常")
             raise HTTPError(400, f"期货卖出平仓(平今)失败: {str(e)}")
@@ -1925,9 +1705,11 @@ class FuturesSellCloseYdayFirstHandler(BaseHandler):
     def post(self):
         try:
             data = self.json_body()
-            sell_close_ydayfirst(data['stock'], int(data['amount']), data.get('style', 'LATEST'),
-                                 float(data.get('price', 0)), self.ctx(), data.get('accId', self.acc()))
+            sell_close_ydayfirst(data['stock'], integer(data['amount'], 'amount'), data.get('style', 'LATEST'),
+                                 number(data.get('price', 0), 'price'), self.ctx(), data.get('accId', self.acc()))
             self.write(json.dumps({"status": "success", "action": "sell_close_ydayfirst", "stock": data['stock']}, ensure_ascii=False))
+        except HTTPError:
+            raise
         except Exception as e:
             logger.exception("sell_close_ydayfirst异常")
             raise HTTPError(400, f"期货卖出平仓(平昨)失败: {str(e)}")
@@ -1943,6 +1725,8 @@ class CancelTaskHandler(BaseHandler):
             accountType = data.get('accountType', 'stock')
             ret = cancel_task(taskId, self.acc(), accountType, self.ctx())
             self.write(json.dumps({"status": "success" if ret else "failed", "taskId": taskId}, ensure_ascii=False))
+        except HTTPError:
+            raise
         except Exception as e:
             logger.exception("cancel_task异常")
             raise HTTPError(400, f"撤销任务失败: {str(e)}")
@@ -1956,6 +1740,8 @@ class PauseTaskHandler(BaseHandler):
             accountType = data.get('accountType', 'stock')
             ret = pause_task(taskId, self.acc(), accountType, self.ctx())
             self.write(json.dumps({"status": "success" if ret else "failed", "taskId": taskId}, ensure_ascii=False))
+        except HTTPError:
+            raise
         except Exception as e:
             logger.exception("pause_task异常")
             raise HTTPError(400, f"暂停任务失败: {str(e)}")
@@ -1969,6 +1755,8 @@ class ResumeTaskHandler(BaseHandler):
             accountType = data.get('accountType', 'stock')
             ret = resume_task(taskId, self.acc(), accountType, self.ctx())
             self.write(json.dumps({"status": "success" if ret else "failed", "taskId": taskId}, ensure_ascii=False))
+        except HTTPError:
+            raise
         except Exception as e:
             logger.exception("resume_task异常")
             raise HTTPError(400, f"继续任务失败: {str(e)}")
@@ -1979,6 +1767,8 @@ class DoOrderHandler(BaseHandler):
         try:
             do_order(self.ctx())
             self.write(json.dumps({"status": "success", "message": "信号已触发"}, ensure_ascii=False))
+        except HTTPError:
+            raise
         except Exception as e:
             logger.exception("do_order异常")
             raise HTTPError(400, f"触发信号失败: {str(e)}")
@@ -2153,7 +1943,7 @@ class ExtDataHandler(BaseHandler):
         data = self.json_body()
         extdataname = data.get('extdataname', '')
         stockcode = data.get('stockcode', '')
-        deviation = int(data.get('deviation', '0'))
+        deviation = integer(data.get('deviation', '0'), 'deviation')
         ret = safe_call(ext_data, extdataname, stockcode, deviation, self.ctx())
         self.write(json.dumps({"extdataname": extdataname, "stockcode": stockcode, "value": ret}, ensure_ascii=False))
 
@@ -2163,7 +1953,7 @@ class ExtDataRankHandler(BaseHandler):
         data = self.json_body()
         extdataname = data.get('extdataname', '')
         stockcode = data.get('stockcode', '')
-        deviation = int(data.get('deviation', '0'))
+        deviation = integer(data.get('deviation', '0'), 'deviation')
         ret = safe_call(ext_data_rank, extdataname, stockcode, deviation, self.ctx())
         self.write(json.dumps({"extdataname": extdataname, "stockcode": stockcode, "rank": ret}, ensure_ascii=False))
 
@@ -2173,7 +1963,7 @@ class GetFactorValueHandler(BaseHandler):
         data = self.json_body()
         factorname = data.get('factorname', '')
         stockcode = data.get('stockcode', '')
-        deviation = int(data.get('deviation', '0'))
+        deviation = integer(data.get('deviation', '0'), 'deviation')
         ret = safe_call(get_factor_value, factorname, stockcode, deviation, self.ctx())
         self.write(json.dumps({"factorname": factorname, "stockcode": stockcode, "value": ret}, ensure_ascii=False))
 
@@ -2183,7 +1973,7 @@ class GetFactorRankHandler(BaseHandler):
         data = self.json_body()
         factorname = data.get('factorname', '')
         stockcode = data.get('stockcode', '')
-        deviation = int(data.get('deviation', '0'))
+        deviation = integer(data.get('deviation', '0'), 'deviation')
         ret = safe_call(get_factor_rank, factorname, stockcode, deviation, self.ctx())
         self.write(json.dumps({"factorname": factorname, "stockcode": stockcode, "rank": ret}, ensure_ascii=False))
 
@@ -2246,14 +2036,16 @@ class BuyHandler(BaseHandler):
         try:
             data = self.json_body()
             stock = data['stock']
-            price = float(data['price'])
-            volume = int(data['volume'])
+            price = number(data['price'], 'price')
+            volume = number(data['volume'], 'volume')
             pr_type = data.get('prType', 11)
             order_ref = passorder(23, 1101, self.acc(), stock, pr_type, price, volume, 'qmt', 2, self.ctx())
             self.write(json.dumps({
                 "status": "success", "action": "buy", "stock": stock,
                 "order_ref": str(order_ref) if order_ref else "unknown"
             }, ensure_ascii=False))
+        except HTTPError:
+            raise
         except Exception as e:
             logger.exception("买入下单异常")
             raise HTTPError(400, f"下单失败: {str(e)}")
@@ -2264,14 +2056,16 @@ class SellHandler(BaseHandler):
         try:
             data = self.json_body()
             stock = data['stock']
-            price = float(data['price'])
-            volume = int(data['volume'])
+            price = number(data['price'], 'price')
+            volume = number(data['volume'], 'volume')
             pr_type = data.get('prType', 11)
             order_ref = passorder(24, 1101, self.acc(), stock, pr_type, price, volume, 'qmt', 2, self.ctx())
             self.write(json.dumps({
                 "status": "success", "action": "sell", "stock": stock,
                 "order_ref": str(order_ref) if order_ref else "unknown"
             }, ensure_ascii=False))
+        except HTTPError:
+            raise
         except Exception as e:
             logger.exception("卖出下单异常")
             raise HTTPError(400, f"下单失败: {str(e)}")
@@ -2313,6 +2107,8 @@ class CancelAllHandler(BaseHandler):
                 "message": f"已发出 {len(canceled_list)} 笔撤单请求",
                 "canceled_orders": canceled_list
             }, ensure_ascii=False))
+        except HTTPError:
+            raise
         except Exception as e:
             logger.exception("全部撤单异常")
             raise HTTPError(500, f"撤单失败: {str(e)}")
@@ -2323,7 +2119,7 @@ class CancelByRuleHandler(BaseHandler):
         try:
             data = self.json_body()
             stock = data.get('stock')
-            cancel_volume = int(data.get('volume', 0))
+            cancel_volume = number(data.get('volume', 0), 'volume')
             account = data.get('account', 'stock')
             if not stock or cancel_volume <= 0:
                 raise HTTPError(400, "参数错误：必须提供 stock 且 volume > 0")
@@ -2345,6 +2141,8 @@ class CancelByRuleHandler(BaseHandler):
                 "message": f"匹配到 {len(target_orders)} 笔订单并发出撤单请求",
                 "canceled_sys_ids": canceled_ids
             }, ensure_ascii=False))
+        except HTTPError:
+            raise
         except Exception as e:
             logger.exception("规则撤单异常")
             raise HTTPError(500, f"撤单失败: {str(e)}")
@@ -2362,35 +2160,46 @@ def sample_ioloop_lag():
 class HealthHandler(BaseHandler):
     def get(self):
         now = monotonic()
-        clients = [
-            {"client_id": client.client_id, "addr": client.request.remote_ip,
-             "state": "connected", "expires_at": None}
-            for client in _WS_CLIENTS
-        ]
-        clients.extend(
-            {"client_id": owner, "addr": client["addr"], "state": "grace",
-             "expires_at": client["expires_at"]}
-            for owner, client in _UNIVERSE_CLIENTS.items() if client["expires"] is not None
-        )
-        # Avoid waiting on the backfill lock, which may be held during disk I/O.
-        backfill = {"pending": len(_BACKFILL_PENDING), "running": len(_BACKFILL_RUNNING)}
-        universe_size = len(_UNIVERSE_SUBSCRIBED)
+        clients = {owner: {
+            "client_id": owner, "addr": state["addr"],
+            "state": "grace" if state["expires"] is not None else "connected",
+            "expires_at": state["expires_at"], "symbols": len(state["universe"]),
+            "realtime": sum(state["universe"].values()),
+            "subscription_count": sum(state["universe"].get(stock, False) for stock, period in _REALTIME_SUBSCRIPTIONS),
+            "streams": sorted(state["connection"].streams) if state["connection"] is not None else [],
+            "queued": 0, "running": 0,
+        } for owner, state in _UNIVERSE_CLIENTS.items()}
+        for client in _WS_CLIENTS:
+            clients.setdefault(client.client_id, {
+                "client_id": client.client_id, "addr": client.request.remote_ip,
+                "state": "connected", "expires_at": None, "symbols": 0, "realtime": 0,
+                "subscription_count": 0, "streams": sorted(client.streams), "queued": 0, "running": 0,
+            })
+        downloads = {"queued": 0, "running": 0}
+        with _DOWNLOAD_LOCK:
+            for request in _DOWNLOADS.values():
+                owner = request["client_id"]
+                client = clients.setdefault(owner, {
+                    "client_id": owner, "addr": None, "state": "disconnected", "expires_at": None,
+                    "symbols": 0, "realtime": 0, "subscription_count": 0, "streams": [],
+                    "queued": 0, "running": 0,
+                })
+                if request["status"] in downloads:
+                    downloads[request["status"]] += 1
+                    client[request["status"]] += 1
         self.write(json.dumps({
-            "bridge_id": _BRIDGE_ID,
-            "started_at": _STARTED_AT,
+            "bridge_id": _BRIDGE_ID, "started_at": _STARTED_AT,
             "ioloop_lag_ms": {
                 "latest": _IOLOOP_LAG_SAMPLES[-1][1] if _IOLOOP_LAG_SAMPLES else None,
                 "max_60s": max((lag for sampled_at, lag in _IOLOOP_LAG_SAMPLES if sampled_at >= now - 60), default=None),
             },
             "realtime": {
-                "last_push_at": _REALTIME_LAST_PUSH_AT,
-                "pushed_symbol_count": _REALTIME_PUSHED_SYMBOL_COUNT,
+                "last_push_at": _REALTIME_LAST_PUSH_AT, "pushed_symbol_count": _REALTIME_PUSHED_SYMBOL_COUNT,
                 "symbol_count": sum(_UNIVERSE_SUBSCRIBED.values()),
                 "subscription_count": len(_REALTIME_SUBSCRIPTIONS),
             },
-            "universe_size": universe_size,
-            "backfill": backfill,
-            "clients": sorted(clients, key=lambda client: (client["client_id"], client["addr"])),
+            "universe_size": len(_UNIVERSE_SUBSCRIBED),
+            "downloads": downloads, "clients": sorted(clients.values(), key=lambda client: client["client_id"]),
         }, ensure_ascii=False))
 
 
@@ -2481,9 +2290,7 @@ def make_app():
         (r"/api/data/risk_free_rate", RiskFreeRateHandler),
         (r"/api/data/date_location", DateLocationHandler),
         (r"/api/data/history_data", HistoryDataHandler),
-        (r"/api/data/backfill/request", BackfillRequestHandler),
-        (r"/api/data/backfill/targets", BackfillTargetsHandler),
-        (r"/api/data/backfill/status", BackfillStatusHandler),
+        (r"/api/data/download", DownloadHandler),
         (r"/api/data/market_data", MarketDataHandler),
         (r"/api/data/market_data_ex", MarketDataExHandler),
         (r"/api/data/full_tick", FullTickHandler),
@@ -2575,7 +2382,7 @@ def make_app():
         (r"/api/sys/python_version", PythonVersionHandler),
         (r"/api/sys/shutdown", ShutdownHandler),
 
-    ], debug=False, compress_response=True, websocket_ping_interval=30, websocket_ping_timeout=30)
+    ], debug=False, compress_response=True, websocket_ping_interval=30, websocket_ping_timeout=30, websocket_max_message_size=_MESSAGE_LIMIT)
 
 
 def _stop_server_on_ioloop(reason):
@@ -2606,7 +2413,8 @@ def _shutdown_server(reason="stop"):
     if _STOPPING:
         return
     _STOPPING = True
-    _BACKFILL_STOP.set()
+    _DOWNLOAD_STOP.set()
+    _DOWNLOAD_WAKE.set()
     try:
         if _IOLOOP is None:
             logger.info("QMT HTTP Server no active IOLoop; port 0.0.0.0:%s already released", PORT)
@@ -2643,9 +2451,9 @@ def init(ContextInfo):
         app.accountID = ContextInfo.accountID
 
         _APP = app
-        _SERVER = HTTPServer(app)
+        _SERVER = HTTPServer(app, max_body_size=_MESSAGE_LIMIT, max_buffer_size=_WRITE_LIMIT)
         _SERVER.listen(PORT, address='0.0.0.0')
-        start_backfill_worker()
+        start_download_worker()
         _IOLOOP_LAG_SAMPLES.clear()
         _HEALTH_SAMPLER = PeriodicCallback(sample_ioloop_lag, 1000)
         _IOLOOP_LAST_TICK = monotonic()
@@ -2695,7 +2503,7 @@ def on_order_stock(order):
         sys_id = getattr(order, "m_strOrderSysID", "") or data.get("m_strOrderSysID", "")
         status = getattr(order, "m_nOrderStatus", "") or data.get("m_nOrderStatus", "")
         logger.info("QMT on_order_stock received: sys_id=%s status=%s", sys_id, status)
-        _queue_broadcast({"type": "order_update", "data": data})
+        _queue_broadcast({"type": "order_update", "data": data}, "order")
     except Exception as e:
         logger.exception("QMT on_order_stock processing failed: %s", e)
 
@@ -2722,7 +2530,7 @@ def on_order_deal(deal):
         price = getattr(deal, "m_dPrice", "") or data.get("m_dPrice", "")
         volume = getattr(deal, "m_nVolume", "") or data.get("m_nVolume", "")
         logger.info("QMT on_order_deal received: trade_id=%s order_id=%s price=%s volume=%s", trade_id, order_id, price, volume)
-        _queue_broadcast({"type": "deal_update", "data": data})
+        _queue_broadcast({"type": "deal_update", "data": data}, "deal")
     except Exception as e:
         logger.exception("QMT on_order_deal processing failed: %s", e)
 

@@ -3,7 +3,7 @@ import importlib.util
 import json
 import locale
 import sys
-import tempfile
+import threading
 import types
 import unittest
 from datetime import datetime, timedelta
@@ -24,7 +24,14 @@ class _TornadoStub:
 
 web = types.ModuleType("tornado.web")
 web.Application = web.RequestHandler = _TornadoStub
-web.HTTPError = type("HTTPError", (Exception,), {})
+class HTTPError(Exception):
+    def __init__(self, status_code, log_message=None, *args):
+        self.status_code = status_code
+        self.log_message = log_message
+        super().__init__(*args)
+
+
+web.HTTPError = HTTPError
 ioloop = types.ModuleType("tornado.ioloop")
 ioloop.IOLoop = ioloop.PeriodicCallback = _TornadoStub
 httpserver = types.ModuleType("tornado.httpserver")
@@ -42,29 +49,32 @@ with patch.object(locale, "setlocale"), patch.dict(sys.modules, {
 class UniverseProtocolTest(unittest.TestCase):
     def setUp(self):
         for name in ("_UNIVERSE_SUBSCRIBED", "_UNIVERSE_CLIENTS", "_REALTIME_SUBSCRIPTIONS",
-                     "_REALTIME_RELEASE_AT", "_BACKFILL_RESULTS", "_HISTORY_CLIENT_ACKS"):
+                     "_REALTIME_RELEASE_AT", "_DOWNLOADS", "_DOWNLOAD_JOBS", "_DOWNLOAD_QUEUE"):
             getattr(qmt, name).clear()
-        qmt._BACKFILL_PENDING.clear()
-        qmt._BACKFILL_RUNNING.clear()
-        qmt._BACKFILL_REQUESTS.clear()
-        qmt._BACKFILL_REQUEST_QUEUE.clear()
-        qmt._BACKFILL_REQUEST_PAIRS.clear()
-        qmt._HISTORY_MANIFESTS.clear()
         qmt._WS_CLIENTS.clear()
-        qmt._HISTORY_SEQUENCE = 0
+        qmt._BROADCAST_QUEUE.clear()
+        qmt._BROADCAST_SCHEDULED = False
         qmt._REALTIME_LAST_5M = 0
         qmt._IOLOOP_LAST_TICK = None
         qmt._IOLOOP_LAG_SAMPLES.clear()
         qmt._REALTIME_LAST_PUSH_AT = None
         qmt._REALTIME_PUSHED_SYMBOL_COUNT = 0
-        qmt._BACKFILL_STOP.clear()
-        qmt._BACKFILL_STATE_PATH = None
+        qmt._DOWNLOAD_STOP.clear()
+        qmt._DOWNLOAD_WAKE.clear()
         qmt._IOLOOP = types.SimpleNamespace(add_callback=lambda function, *args: function(*args))
         self.ctx = Mock()
         self.ctx.subscribe_quote.side_effect = range(1, 1000)
         self.ctx.get_market_data_ex.side_effect = lambda fields, stocks, *args: {stock: {"close": {"20261026093100": 10}} for stock in stocks}
-        qmt._APP = types.SimpleNamespace(ContextInfo=self.ctx)
+        qmt._APP = types.SimpleNamespace(ContextInfo=self.ctx, accountID="offline")
         self.client = self.make_client("first")
+
+    def handler(self, kind, body):
+        handler = kind.__new__(kind)
+        handler.request = types.SimpleNamespace(body=json.dumps(body).encode("utf-8"), headers={"X-Token": qmt.TOKEN})
+        handler.application = qmt._APP
+        handler.write = Mock()
+        handler.set_status = Mock()
+        return handler
 
     def make_client(self, name):
         client = qmt.MarketWebSocketHandler.__new__(qmt.MarketWebSocketHandler)
@@ -78,20 +88,12 @@ class UniverseProtocolTest(unittest.TestCase):
         qmt._WS_CLIENTS.add(client)
         return client
 
+
     def configure(self, client, universe, **options):
         client.handle_configure({"client_id": client.client_id, "universe": [
             {"symbol": stock, "subscribed": subscribed} for stock, subscribed in universe.items()
         ], **options})
 
-    def test_false_and_true_scope_keeps_full_history_universe(self):
-        self.configure(self.client, {"600000.SH": False, "000300.SH": True})
-        self.assertEqual(qmt._UNIVERSE_SUBSCRIBED, {"600000.SH": False, "000300.SH": True})
-        self.assertEqual(qmt._BACKFILL_PENDING, {
-            ("600000.SH", "1d"), ("600000.SH", "5m"),
-            ("000300.SH", "1d"), ("000300.SH", "5m"), ("000300.SH", "1m"),
-        })
-        self.assertEqual(self.client.sent[0]["symbols"], 2)
-        self.assertEqual(self.client.sent[0]["realtime"], 1)
 
     def test_invalid_or_legacy_boolean_fails_without_replacing_scope(self):
         self.configure(self.client, {"OLD.SH": True})
@@ -105,6 +107,7 @@ class UniverseProtocolTest(unittest.TestCase):
             self.assertEqual(self.client.universe, {"OLD.SH": True})
             self.assertEqual(self.client.sent[-1]["type"], "error")
 
+
     def test_combined_limit_is_rejected_without_mutating_other_client(self):
         self.configure(self.client, {"S%d.SH" % i: True for i in range(50)})
         second = self.make_client("second")
@@ -113,6 +116,7 @@ class UniverseProtocolTest(unittest.TestCase):
         self.assertNotIn("second", qmt._UNIVERSE_CLIENTS)
         self.assertEqual(len(qmt._UNIVERSE_SUBSCRIBED), 50)
         self.assertEqual(self.ctx.subscribe_quote.call_count, 100)
+
 
     def test_retiring_quotes_count_toward_global_native_limit(self):
         with patch.object(qmt, "_QMT_REALTIME_SYMBOL_LIMIT", 2), patch.object(qmt, "monotonic", return_value=1000):
@@ -123,11 +127,13 @@ class UniverseProtocolTest(unittest.TestCase):
         self.assertEqual(second.sent[-1]["type"], "error")
         self.assertEqual(set(qmt._REALTIME_SUBSCRIPTIONS), {("A.SH", "1m"), ("A.SH", "5m")})
 
+
     def test_empty_configured_client_cannot_change_identity_and_leave_ghost_state(self):
         self.configure(self.client, {})
         self.client.handle_configure({"client_id": "different", "universe": []})
         self.assertEqual(self.client.sent[-1]["type"], "error")
         self.assertEqual(set(qmt._UNIVERSE_CLIENTS), {"first"})
+
 
     def test_overlapping_clients_subscribe_and_read_once_and_filter_delivery(self):
         self.configure(self.client, {"A.SH": True, "B.SH": True})
@@ -149,6 +155,7 @@ class UniverseProtocolTest(unittest.TestCase):
             qmt.push_global_market_data()
         self.assertEqual(self.ctx.get_market_data_ex.call_count, 3)  # 5m waits five seconds.
 
+
     def test_disconnect_grace_keeps_quotes_and_other_client_live(self):
         self.configure(self.client, {"A.SH": True, "B.SH": True})
         second = self.make_client("second")
@@ -167,6 +174,7 @@ class UniverseProtocolTest(unittest.TestCase):
         self.assertEqual(set(qmt._REALTIME_SUBSCRIPTIONS), {("B.SH", "1m"), ("B.SH", "5m")})
         self.assertEqual(self.ctx.unsubscribe_quote.call_count, 2)
 
+
     def test_same_client_id_reconnect_replaces_state_and_old_close_cannot_release_new(self):
         self.configure(self.client, {"A.SH": True})
         replacement = self.make_client("first")
@@ -175,8 +183,9 @@ class UniverseProtocolTest(unittest.TestCase):
         self.assertIs(qmt._UNIVERSE_CLIENTS["first"]["connection"], replacement)
         self.assertIsNone(qmt._UNIVERSE_CLIENTS["first"]["expires"])
         self.assertEqual(self.ctx.subscribe_quote.call_count, 2)
-        self.assertEqual(replacement.sent[0]["queued"], 2)
+        self.assertNotIn("queued", replacement.sent[0])
         self.assertEqual(len(qmt._UNIVERSE_CLIENTS), 1)
+
 
     def test_explicit_reference_removal_also_has_unsubscribe_grace(self):
         self.configure(self.client, {"A.SH": True})
@@ -187,228 +196,6 @@ class UniverseProtocolTest(unittest.TestCase):
             qmt.push_global_market_data()
         self.assertEqual(self.ctx.unsubscribe_quote.call_count, 2)
 
-    def test_two_clients_queue_and_download_same_pair_once(self):
-        self.configure(self.client, {"A.SH": True})
-        second = self.make_client("second")
-        self.configure(second, {"A.SH": True})
-        self.assertEqual(second.sent[0]["queued"], 0)
-        downloads = []
-
-        def download(stocks, period, start, end):
-            downloads.append((stocks, period, start, end))
-            qmt._BACKFILL_STOP.set()
-
-        with patch.object(qmt, "trading_hours", return_value=True), patch.object(qmt, "schedule_incremental_backfill"), patch.object(qmt, "download_history_range", side_effect=download):
-            qmt.backfill_worker()
-        self.assertEqual(len(downloads), 1)
-        self.assertEqual(downloads[0][:2], (["A.SH"], "1m"))
-        self.assertTrue(all(downloads[0][2:]))
-        self.assertNotIn(("A.SH", "1m"), qmt._BACKFILL_PENDING)
-        self.assertEqual(qmt._BACKFILL_PENDING, {("A.SH", "1d"), ("A.SH", "5m")})
-        for client in (self.client, second):
-            self.assertEqual(client.sent[-1]["type"], "history_ready")
-
-    def request_body(self, **changes):
-        today = datetime.now(qmt._QMT_TIMEZONE).strftime("%Y%m%d")
-        return dict({"symbols": ["600000.SH"], "period": "5m",
-                     "start_time": today + "000000", "end_time": today + "000000"}, **changes)
-
-    def submit_request(self, **changes):
-        handler = qmt.BackfillRequestHandler.__new__(qmt.BackfillRequestHandler)
-        handler.json_body = lambda: self.request_body(**changes)
-        handler.set_status = Mock()
-        handler.write = Mock()
-        handler.post()
-        self.assertEqual(handler.set_status.call_args.args, (202,))
-        return json.loads(handler.write.call_args.args[0])
-
-    def poll_request(self, request_id):
-        handler = qmt.BackfillRequestHandler.__new__(qmt.BackfillRequestHandler)
-        handler.get_argument = lambda name, default: request_id
-        handler.write = Mock()
-        handler.get()
-        return json.loads(handler.write.call_args.args[0])
-
-    def test_backfill_request_validates_today_and_future_bounds(self):
-        now = datetime.fromisoformat("2026-10-26T10:00:00+08:00")
-        with patch.object(qmt, "datetime", wraps=datetime) as clock:
-            clock.now.return_value = now
-            request = self.request_body(symbols=["600000.sh", "000001.SZ", "920001.BJ", "600000.SH"],
-                                        start_time="20261026000000", end_time="20261026000000")
-            self.assertEqual(qmt.validate_backfill_request(request)[0], sorted(set(symbol.upper() for symbol in request["symbols"])))
-            for changes in ({"symbols": []}, {"symbols": "600000.SH"}, {"symbols": [None]},
-                            {"symbols": ["A.SH"]}, {"symbols": ["000300.SH"]},
-                            {"symbols": ["510300.SH"]}, {"symbols": ["399001.SZ"]}, {"period": "1d"},
-                            {"start_time": "20261026"}, {"start_time": 20261026093000},
-                            {"start_time": "20261026096000"}, {"end_time": "20261026100001"},
-                            {"start_time": "20261025093000"}, {"end_time": "20261027000000"},
-                            {"start_time": "20261026093000", "end_time": "20261026090000"}):
-                with self.subTest(changes=changes), self.assertRaises(ValueError):
-                    qmt.validate_backfill_request(dict(request, **changes))
-            qmt.validate_backfill_request(dict(request, end_time="20261026100000"))
-
-    def test_backfill_request_routes_and_authentication(self):
-        with patch.object(qmt, "Application") as app:
-            qmt.make_app()
-        self.assertIn(("/api/data/backfill/request", qmt.BackfillRequestHandler), app.call_args.args[0])
-        handler = qmt.BackfillRequestHandler.__new__(qmt.BackfillRequestHandler)
-        for headers in ({}, {"X-Token": "wrong"}):
-            handler.request = types.SimpleNamespace(headers=headers)
-            with self.assertRaises(qmt.HTTPError) as error:
-                handler.prepare()
-            self.assertEqual(error.exception.args[0], 401)
-        handler.request = types.SimpleNamespace(headers={"X-Token": qmt.TOKEN})
-        handler.prepare()
-        with self.assertRaises(qmt.HTTPError) as error:
-            self.submit_request(period="1d")
-        self.assertEqual(error.exception.args[0], 400)
-        with self.assertRaises(qmt.HTTPError) as error:
-            self.poll_request("missing")
-        self.assertEqual(error.exception.args[0], 404)
-
-    def test_backfill_request_deduplicates_and_rejects_uncovered_active_ranges(self):
-        first = self.submit_request(symbols=["600000.SH", "000001.SZ"])
-        repeat = self.submit_request(symbols=["000001.sz", "600000.SH", "000001.SZ"])
-        self.assertEqual(first, repeat)
-        self.assertEqual(len(qmt._BACKFILL_REQUEST_QUEUE), 1)
-        for changes in ({"symbols": ["600000.SH"]}, {"start_time": self.request_body()["start_time"][:-2] + "01"}):
-            # A conflicting pair is not a successful new range or a second download.
-            if "start_time" in changes:
-                changes["end_time"] = changes["start_time"]
-            with self.assertRaises(qmt.HTTPError) as error:
-                self.submit_request(**changes)
-            self.assertEqual(error.exception.args[0], 409)
-        selected = qmt.take_backfill_request()
-        running = self.poll_request(first["id"])
-        self.assertEqual(running["status"], "running")
-        self.assertTrue(all(item["status"] == "running" for item in running["results"].values()))
-        self.assertEqual(self.submit_request(symbols=["600000.SH", "000001.SZ"]), running)
-        with patch.object(qmt, "download_history_range") as download:
-            qmt.run_backfill_request(*selected)
-        download.assert_called_once_with(first["symbols"], "5m", first["start_time"], first["end_time"])
-        result = self.poll_request(first["id"])
-        self.assertEqual(result["status"], "success")
-        self.assertTrue(all(item == {"status": "success", "error": None} for item in result["results"].values()))
-        self.assertFalse(qmt._BACKFILL_REQUEST_PAIRS)
-        self.assertFalse(qmt._BACKFILL_RUNNING)
-        self.assertNotEqual(self.submit_request()["id"], first["id"])
-
-    def test_backfill_request_shares_reservations_without_consuming_archive_work(self):
-        self.configure(self.client, {"600000.SH": True})
-        self.submit_request(period="1m")
-        with patch.object(qmt, "trading_hours", return_value=True):
-            self.assertEqual(qmt.take_backfill_batch(), [])
-        with patch.object(qmt, "download_history_range") as downloader:
-            with self.assertRaises(qmt.HTTPError):
-                qmt.download_history_page(["600000.SH"], "1m", "20260101000000", "20260101100000")
-        downloader.assert_not_called()
-        selected = qmt.take_backfill_request()
-        with patch.object(qmt, "download_history_range"):
-            qmt.run_backfill_request(*selected)
-        self.assertEqual(qmt._BACKFILL_PENDING, {("600000.SH", "1m"), ("600000.SH", "5m"), ("600000.SH", "1d")})
-        qmt._BACKFILL_RUNNING.add(("600000.SH", "5m"))
-        with self.assertRaises(qmt.HTTPError) as error:
-            self.submit_request()
-        self.assertEqual(error.exception.args[0], 409)
-
-    def test_backfill_request_limit_is_global_active_requests_not_archive_pairs(self):
-        self.configure(self.client, {"S%d.SH" % i: False for i in range(100)})
-        for index in range(50):
-            self.submit_request(symbols=["%06d.SH" % (600000 + index)])
-        self.assertEqual(len(qmt._BACKFILL_REQUESTS), 50)
-        with self.assertRaises(qmt.HTTPError) as error:
-            self.submit_request(symbols=["600999.SH"])
-        self.assertEqual(error.exception.args[0], 429)
-        selected = qmt.take_backfill_request()
-        with self.assertRaises(qmt.HTTPError) as error:
-            self.submit_request(symbols=["600999.SH"])
-        self.assertEqual(error.exception.args[0], 429)  # Running requests still occupy capacity.
-        with patch.object(qmt, "download_history_range"):
-            qmt.run_backfill_request(*selected)
-        self.assertEqual(self.submit_request(symbols=["600999.SH"])["status"], "queued")
-        self.assertEqual(len(qmt._BACKFILL_PENDING), 200)
-
-    def test_backfill_request_retains_200_completed_without_removing_active_requests(self):
-        completed = []
-        with patch.object(qmt, "download_history_range") as download, patch.object(qmt.logger, "exception"):
-            for index in range(202):
-                download.side_effect = RuntimeError("native failure") if index % 2 else None
-                completed.append(self.submit_request()["id"])
-                qmt.run_backfill_request(*qmt.take_backfill_request())
-        running = self.submit_request(symbols=["600001.SH"])
-        qmt.take_backfill_request()
-        queued = self.submit_request(symbols=["600002.SH"])
-        self.assertEqual(set(qmt._BACKFILL_REQUESTS), set(completed[-200:] + [running["id"], queued["id"]]))
-        self.assertEqual(self.poll_request(running["id"])["status"], "running")
-        self.assertEqual(self.poll_request(queued["id"])["status"], "queued")
-        self.assertEqual(self.poll_request(completed[-2])["status"], "success")
-        self.assertEqual(self.poll_request(completed[-1])["status"], "failed")
-        for request_id in completed[:2]:
-            with self.assertRaises(qmt.HTTPError) as error:
-                self.poll_request(request_id)
-            self.assertEqual(error.exception.args[0], 404)
-
-    def test_backfill_request_downloads_any_symbol_count_on_worker_and_never_broadcasts(self):
-        symbols = ["%06d.SH" % (600000 + index) for index in range(101)]
-        payload = self.submit_request(symbols=symbols)
-        qmt._BACKFILL_PENDING.add(("UNIVERSE.SH", "1m"))
-
-        def download(stocks, period, start, end):
-            self.assertEqual(stocks, symbols)
-            self.assertEqual(self.poll_request(payload["id"])["status"], "running")
-            qmt._BACKFILL_STOP.set()
-
-        with patch.object(qmt, "trading_hours", return_value=True), patch.object(qmt, "schedule_incremental_backfill"), patch.object(qmt, "download_history_range", side_effect=download) as downloader, patch.object(qmt, "take_backfill_batch") as archive, patch.object(qmt, "_queue_broadcast") as broadcast:
-            qmt.backfill_worker()
-        downloader.assert_called_once()
-        archive.assert_not_called()
-        broadcast.assert_not_called()
-        self.assertFalse(qmt._UNIVERSE_SUBSCRIBED)
-        self.assertFalse(qmt._BACKFILL_RESULTS)  # A small directed range never claims archive coverage.
-        self.assertFalse(qmt._HISTORY_MANIFESTS)
-        self.assertEqual(qmt._BACKFILL_PENDING, {("UNIVERSE.SH", "1m")})
-        self.ctx.get_market_data_ex.assert_not_called()
-        self.assertEqual(self.poll_request(payload["id"])["status"], "success")
-
-    def test_backfill_request_reports_failure_and_releases_reservations(self):
-        payload = self.submit_request(symbols=["600000.SH", "000001.SZ"])
-        selected = qmt.take_backfill_request()
-        with patch.object(qmt, "download_history_range", side_effect=RuntimeError("native failure")):
-            qmt.run_backfill_request(*selected)
-        failed = self.poll_request(payload["id"])
-        self.assertEqual(failed["status"], "failed")
-        self.assertTrue(all(item == {"status": "failed", "error": "native failure"} for item in failed["results"].values()))
-        self.assertFalse(qmt._BACKFILL_REQUEST_PAIRS)
-        self.assertFalse(qmt._BACKFILL_RUNNING)
-        self.assertEqual(self.submit_request()["status"], "queued")
-
-    def test_trading_hours_include_beijing_weekday_boundaries(self):
-        for text, expected in (("2026-10-26T09:14:59+08:00", False), ("2026-10-26T01:15:00+00:00", True),
-                               ("2026-10-26T15:05:59+08:00", True), ("2026-10-26T15:06:00+08:00", False),
-                               ("2026-10-25T10:00:00+08:00", False)):
-            self.assertEqual(qmt.trading_hours(datetime.fromisoformat(text)), expected)
-
-    def test_trading_batch_defers_archives_and_unsubscribed_minutes(self):
-        self.configure(self.client, {"A.SH": True, "B.SH": False})
-        qmt._BACKFILL_PENDING.add(("B.SH", "1m"))
-        with patch.object(qmt, "trading_hours", return_value=True):
-            self.assertEqual(qmt.take_backfill_batch(), [("A.SH", "1m")])
-            self.assertEqual(qmt.take_backfill_batch(), [])
-        self.assertEqual(qmt._BACKFILL_PENDING, {("A.SH", "1d"), ("A.SH", "5m"), ("B.SH", "1d"), ("B.SH", "5m")})
-        with patch.object(qmt, "trading_hours", return_value=False):
-            self.assertEqual({period for stock, period in qmt.take_backfill_batch()}, {"1d"})
-
-    def test_trading_http_download_is_rejected_before_any_native_call(self):
-        handler = qmt.HistoryDataHandler.__new__(qmt.HistoryDataHandler)
-        handler.json_body = lambda: {"stock_code": "A.SH", "period": "1d", "download": True}
-        handler.set_header = Mock()
-        handler.ctx = Mock(return_value=self.ctx)
-        with patch.object(qmt, "trading_hours", return_value=True), patch.object(qmt, "download_history_range") as downloader:
-            with self.assertRaises(qmt.HTTPError) as error:
-                handler.post()
-        self.assertEqual(error.exception.args[0], 503)
-        downloader.assert_not_called()
-        handler.ctx.assert_not_called()
 
     def test_local_history_reads_are_paged(self):
         qmt.validate_history_page(["A.SH"] * 5, "5m", "20261001000000", "20261007235959", -1)
@@ -418,217 +205,20 @@ class UniverseProtocolTest(unittest.TestCase):
             with self.assertRaises(qmt.HTTPError):
                 qmt.validate_history_page(stocks, period, start, end, count)
 
-    def test_manifest_ack_is_per_client_and_replay_is_filtered(self):
-        self.configure(self.client, {"A.SH": False, "B.SH": True})
-        second = self.make_client("second")
-        self.configure(second, {"B.SH": True, "C.SH": False})
-        qmt._announce_history(["B.SH", "A.SH"], "1d", "20260101000000", "20261026150000", False)
-        manifest = qmt._HISTORY_MANIFESTS[0]
-        self.assertEqual(self.client.sent[-1]["symbols"], ["A.SH", "B.SH"])
-        self.assertEqual(second.sent[-1]["symbols"], ["B.SH"])
-        self.client.handle_history_ack({"id": manifest["id"], "bridge_id": qmt._BRIDGE_ID})
-        self.assertIsNone(qmt.history_for_client(manifest, self.client))
-        self.assertEqual(qmt.history_for_client(manifest, second)["symbols"], ["B.SH"])
-        self.assertEqual(len(qmt._HISTORY_MANIFESTS), 1)
-        self.configure(self.client, self.client.universe)
-        self.assertEqual(self.client.sent[-1]["type"], "configured")
-        self.configure(second, second.universe)
-        self.assertEqual(second.sent[-1]["type"], "history_ready")
-        third = self.make_client("third")
-        self.configure(third, {"C.SH": False})
-        self.assertEqual(third.sent[-1]["type"], "configured")
-
-    def test_manifest_merges_bounded_and_incremental_and_caps_archive(self):
-        qmt._announce_history(["B.SH", "A.SH"], "5m", "20260101000000", "20261025150000", False)
-        old_id = qmt._HISTORY_MANIFESTS[0]["id"]
-        qmt._announce_history(["A.SH", "B.SH"], "5m", "20261020000000", "20261026150000", True)
-        self.assertEqual(len(qmt._HISTORY_MANIFESTS), 1)
-        merged = qmt._HISTORY_MANIFESTS[0]
-        self.assertNotEqual(merged["id"], old_id)
-        self.assertFalse(merged["incremental"])
-        self.assertEqual(merged["start_time"], (datetime(2026, 10, 26, 15) - timedelta(days=180)).strftime("%Y%m%d%H%M%S"))
-        self.assertEqual(merged["end_time"], "20261026150000")
-        with patch.object(qmt, "_HISTORY_MANIFEST_LIMIT", 2):
-            qmt._announce_history(["C.SH"], "5m", "20260101000000", "20261026150000", False)
-            qmt._announce_history(["D.SH"], "5m", "20260101000000", "20261026150000", False)
-        self.assertEqual(len(qmt._HISTORY_MANIFESTS), 2)
-
-    def test_ack_with_old_bridge_namespace_cannot_ack_current_work(self):
-        self.configure(self.client, {"A.SH": True})
-        qmt._announce_history(["A.SH"], "1m", "20261020000000", "20261026100000", False)
-        manifest = qmt._HISTORY_MANIFESTS[0]
-        self.client.handle_history_ack({"id": manifest["id"], "bridge_id": "old-process"})
-        self.assertEqual(self.client.sent[-1]["type"], "error")
-        self.assertIsNotNone(qmt.history_for_client(manifest, self.client))
-
-    def test_persisted_success_is_reused_without_download_and_reannounced_after_restart(self):
-        with tempfile.TemporaryDirectory() as directory:
-            qmt._BACKFILL_STATE_PATH = str(Path(directory) / "state.json")
-            qmt._BACKFILL_RESULTS["A.SH:1d"] = {"status": "success", "start_time": "20000101000000", "end_time": "20991231150000"}
-            qmt._BACKFILL_RESULTS["B.SH:1d"] = {"status": "failed"}
-            qmt.save_backfill_results()
-            qmt._BACKFILL_RESULTS.clear()
-            qmt.load_backfill_results()
-            self.assertEqual(set(qmt._BACKFILL_RESULTS), {"A.SH:1d"})
-            self.configure(self.client, {"A.SH": False})
-            self.assertNotIn(("A.SH", "1d"), qmt._BACKFILL_PENDING)
-            self.assertIn(("A.SH", "5m"), qmt._BACKFILL_PENDING)
-            manifests = [item for item in self.client.sent if item["type"] == "history_ready"]
-            self.assertEqual(manifests[-1]["period"], "1d")
-            self.assertEqual(manifests[-1]["symbols"], ["A.SH"])
-            self.configure(self.client, {"A.SH": False}, refresh_history=True)
-            self.assertNotIn("A.SH:1d", qmt._BACKFILL_RESULTS)
-            self.assertIn(("A.SH", "1d"), qmt._BACKFILL_PENDING)
-            qmt._BACKFILL_RESULTS.clear()
-            qmt.load_backfill_results()
-            self.assertNotIn("A.SH:1d", qmt._BACKFILL_RESULTS)
-
-    def test_expanded_scope_gets_new_manifest_after_acking_filtered_archive(self):
-        self.configure(self.client, {"A.SH": False})
-        second = self.make_client("second")
-        self.configure(second, {"B.SH": False})
-        for stock in ("A.SH", "B.SH"):
-            qmt._BACKFILL_RESULTS[stock + ":1d"] = {"status": "success", "start_time": "20000101000000", "end_time": "20991231150000"}
-        qmt._announce_history(["A.SH", "B.SH"], "1d", "20260101000000", "20261026150000", False)
-        old = self.client.sent[-1]
-        self.client.handle_history_ack({"id": old["id"]})
-        self.configure(self.client, {"A.SH": False, "B.SH": False})
-        fresh = [item for item in self.client.sent if item["type"] == "history_ready" and item["id"] != old["id"] and "B.SH" in item["symbols"]]
-        self.assertTrue(fresh)
-
-    def test_stale_persisted_download_rebuilds_full_window_not_just_incremental_tail(self):
-        start, end = qmt.backfill_range("1d")
-        qmt._BACKFILL_RESULTS["A.SH:1d"] = {"status": "success", "start_time": "20000101000000", "end_time": (datetime.now(qmt._QMT_TIMEZONE) - timedelta(days=20)).strftime("%Y%m%d%H%M%S")}
-        self.configure(self.client, {"A.SH": False})
-        manifest = self.client.sent[-1]
-        self.assertEqual(manifest["type"], "history_ready")
-        self.assertFalse(manifest["incremental"])
-        self.assertEqual(manifest["start_time"], start)
-        self.assertIn(("A.SH", "1d"), qmt._BACKFILL_PENDING)
-
-    def test_evicted_unacked_manifest_is_rebuilt_on_unchanged_configure(self):
-        self.configure(self.client, {"A.SH": False})
-        qmt._BACKFILL_RESULTS["A.SH:1d"] = {"status": "success", "start_time": "20000101000000", "end_time": "20991231150000"}
-        with patch.object(qmt, "_HISTORY_MANIFEST_LIMIT", 2):
-            for stock in ("A.SH", "B.SH", "C.SH"):
-                qmt._announce_history([stock], "1d", *qmt.backfill_range("1d"), False)
-            self.assertNotIn("A.SH", {stock for item in qmt._HISTORY_MANIFESTS for stock in item["symbols"]})
-            self.configure(self.client, self.client.universe)
-        self.assertEqual(self.client.sent[-1]["type"], "history_ready")
-        self.assertEqual(self.client.sent[-1]["symbols"], ["A.SH"])
-        self.assertFalse(self.client.sent[-1]["incremental"])
-        self.assertEqual(len(qmt._HISTORY_MANIFESTS), 2)
 
     def test_daily_page_limit_accepts_existing_366_day_research_caller(self):
         qmt.validate_history_page(["A.SH"], "1d", "20251027000000", "20261026235959", 366)
 
-    def test_http_repairs_share_pair_reservations_and_reuse_completed_ranges(self):
-        with patch.object(qmt, "download_history_range") as download:
-            for _ in range(2):
-                qmt.download_history_page(["A.SH"], "1d", "20260101000000", "20261026150000")
-        download.assert_called_once_with(["A.SH"], "1d", "20260101000000", "20261026150000")
-        qmt._BACKFILL_RUNNING.add(("A.SH", "1d"))
-        with patch.object(qmt, "download_history_range") as download:
-            with self.assertRaises(qmt.HTTPError):
-                qmt.download_history_page(["A.SH"], "1d", "20260101000000", "20261027150000")
-        download.assert_not_called()
-
-    def test_partial_http_range_cannot_claim_a_full_background_window(self):
-        with patch.object(qmt, "download_history_range"):
-            qmt.download_history_page(["A.SH"], "1d", "20991230000000", "20991231150000")
-        self.assertFalse(qmt.backfill_result_current("A.SH", "1d"))
-        self.configure(self.client, {"A.SH": False})
-        self.assertIn(("A.SH", "1d"), qmt._BACKFILL_PENDING)
-
-    def test_warm_and_cold_symbols_do_not_force_a_shared_180_day_redownload(self):
-        self.configure(self.client, {"A.SH": False, "B.SH": False})
-        qmt._BACKFILL_RESULTS["B.SH:1d"] = {"status": "success", "start_time": "20000101000000", "end_time": (datetime.now(qmt._QMT_TIMEZONE) - timedelta(days=20)).strftime("%Y%m%d%H%M%S")}
-        with patch.object(qmt, "trading_hours", return_value=False):
-            batch = qmt.take_backfill_batch()
-        self.assertEqual(batch, [("A.SH", "1d")])
-        self.assertIn(("B.SH", "1d"), qmt._BACKFILL_PENDING)
-
-    def test_failed_incremental_download_preserves_completed_window(self):
-        self.configure(self.client, {"A.SH": True})
-        original = {"status": "success", "start_time": "20000101000000", "end_time": (datetime.now(qmt._QMT_TIMEZONE) - timedelta(days=2)).strftime("%Y%m%d%H%M%S")}
-        qmt._BACKFILL_RESULTS["A.SH:1m"] = original
-
-        def fail(*args):
-            qmt._BACKFILL_STOP.set()
-            raise RuntimeError("temporary native failure")
-
-        with patch.object(qmt, "trading_hours", return_value=True), patch.object(qmt, "schedule_incremental_backfill"), patch.object(qmt, "download_history_range", side_effect=fail):
-            qmt.backfill_worker()
-        result = qmt._BACKFILL_RESULTS["A.SH:1m"]
-        self.assertEqual(result["status"], "success")
-        self.assertEqual(result["end_time"], original["end_time"])
-        self.assertIn("temporary native failure", result["last_error"])
-        self.assertFalse(qmt._BACKFILL_RUNNING)
-
-    def test_disjoint_cached_range_is_not_warm_or_merged_across_a_gap(self):
-        previous = {"status": "success", "start_time": "20000101000000", "end_time": "20000102150000"}
-        qmt._BACKFILL_RESULTS["A.SH:1d"] = previous
-        self.assertFalse(qmt.has_backfill_window("A.SH", "1d"))
-        result = qmt.completed_download_range(previous, "20260429000000", "20261026150000")
-        self.assertEqual(result, {"start_time": "20260429000000", "end_time": "20261026150000"})
-        qmt._BACKFILL_RESULTS["A.SH:1d"] = dict(status="success", **result)
-        with patch.object(qmt, "download_history_range") as download:
-            qmt.download_history_page(["A.SH"], "1d", "20260201000000", "20260202150000")
-        download.assert_called_once()  # The never-downloaded gap is not falsely treated as cached.
-
-    def test_running_items_cannot_be_reclaimed_from_pending(self):
-        self.configure(self.client, {"A.SH": True})
-        qmt._BACKFILL_RUNNING.add(("A.SH", "1m"))
-        with patch.object(qmt, "trading_hours", return_value=True):
-            self.assertEqual(qmt.take_backfill_batch(), [])
-        self.assertIn(("A.SH", "1m"), qmt._BACKFILL_PENDING)
-        self.assertIn(("A.SH", "1m"), qmt._BACKFILL_RUNNING)
-
-    def test_failed_http_repair_releases_and_requeues_before_worker_claim(self):
-        self.configure(self.client, {"A.SH": True})
-        with patch.object(qmt, "download_history_range", side_effect=RuntimeError("native failure")):
-            with self.assertRaisesRegex(RuntimeError, "native failure"):
-                qmt.download_history_page(["A.SH"], "1m", "20261020000000", "20261026150000")
-        self.assertFalse(qmt._BACKFILL_RUNNING)
-        self.assertIn(("A.SH", "1m"), qmt._BACKFILL_PENDING)
-        with patch.object(qmt, "trading_hours", return_value=True):
-            self.assertEqual(qmt.take_backfill_batch(), [("A.SH", "1m")])
-        self.assertEqual(qmt._BACKFILL_RUNNING, {("A.SH", "1m")})
-
-    def test_expansion_does_not_promote_a_partial_cache_to_full_window(self):
-        self.configure(self.client, {"A.SH": False})
-        second = self.make_client("second")
-        self.configure(second, {"B.SH": False})
-        for stock in ("A.SH", "B.SH"):
-            qmt._BACKFILL_RESULTS[stock + ":1d"] = {"status": "success", "start_time": "20991230000000", "end_time": "20991231150000"}
-        qmt._announce_history(["A.SH", "B.SH"], "1d", "20991230000000", "20991231150000", False)
-        self.client.handle_history_ack({"id": self.client.sent[-1]["id"]})
-        count = len(qmt._HISTORY_MANIFESTS)
-        self.configure(self.client, {"A.SH": False, "B.SH": False})
-        self.assertEqual(len(qmt._HISTORY_MANIFESTS), count)
-        self.assertFalse(qmt.has_backfill_window("B.SH", "1d"))
-
-    def test_native_downloads_have_explicit_ranges_and_incremental_flag(self):
-        download = Mock()
-        with patch.dict(qmt.__dict__, {"download_history_data2": download}):
-            qmt.download_history_range(["A.SH"], "1d", "20260101000000", "20261026150000")
-        download.assert_called_once_with(["A.SH"], "1d", "20260101000000", "20261026150000", incrementally=True)
-
-    def test_account_orders_and_deals_broadcast_to_all_authenticated_clients(self):
-        second = self.make_client("second")  # No configure required for account-only clients.
-        for kind in ("account_status", "order_update", "deal_update"):
-            qmt._broadcast({"type": kind, "data": {"example": True}})
-            self.assertEqual(self.client.sent[-1]["type"], kind)
-            self.assertEqual(second.sent[-1]["type"], kind)
 
     def test_raw_http_subscription_mutations_cannot_bypass_shared_ownership(self):
         for handler_type in (qmt.SubscribeQuoteHandler, qmt.UnsubscribeQuoteHandler):
             handler = handler_type.__new__(handler_type)
             with self.assertRaises(qmt.HTTPError) as error:
                 handler.post()
-            self.assertEqual(error.exception.args[0], 409)
+            self.assertEqual(error.exception.status_code, 409)
         self.ctx.subscribe_quote.assert_not_called()
         self.ctx.unsubscribe_quote.assert_not_called()
+
 
     def health(self, now=1000):
         handler = qmt.HealthHandler.__new__(qmt.HealthHandler)
@@ -640,6 +230,7 @@ class UniverseProtocolTest(unittest.TestCase):
             handler.get()
         return json.loads(handler.write.call_args.args[0])
 
+
     def test_health_route_requires_header_token(self):
         with patch.object(qmt, "Application") as app:
             qmt.make_app()
@@ -649,68 +240,9 @@ class UniverseProtocolTest(unittest.TestCase):
             handler.request = types.SimpleNamespace(headers=headers)
             with self.assertRaises(qmt.HTTPError) as error:
                 handler.prepare()
-            self.assertEqual(error.exception.args[0], 401)
+            self.assertEqual(error.exception.status_code, 401)
         self.health()  # A valid token is accepted.
 
-    def test_health_does_not_wait_for_backfill_lock(self):
-        class NeverAcquire:
-            def __enter__(self):
-                raise AssertionError("health must not acquire the backfill lock")
-
-            def __exit__(self, *args):
-                pass
-
-        with patch.object(qmt, "_BACKFILL_LOCK", NeverAcquire()):
-            payload = self.health()
-        self.assertEqual(payload["backfill"], {"pending": 0, "running": 0})
-
-    def test_health_empty_and_unknown_facts_are_not_inferred(self):
-        qmt._WS_CLIENTS.clear()
-        payload = self.health()
-        self.assertEqual(payload, {
-            "bridge_id": qmt._BRIDGE_ID,
-            "started_at": qmt._STARTED_AT,
-            "ioloop_lag_ms": {"latest": None, "max_60s": None},
-            "realtime": {"last_push_at": None, "pushed_symbol_count": 0, "symbol_count": 0, "subscription_count": 0},
-            "universe_size": 0,
-            "backfill": {"pending": 0, "running": 0},
-            "clients": [],
-        })
-        self.assertIsNotNone(datetime.fromisoformat(payload["started_at"]).utcoffset())
-        self.assertNotIn(qmt.TOKEN, json.dumps(payload))
-
-    def test_health_lists_unconfigured_connected_and_grace_without_expiring(self):
-        self.configure(self.client, {"A.SH": True, "B.SH": False})
-        unconfigured = self.make_client("unconfigured")
-        with patch.object(qmt, "monotonic", return_value=100):
-            self.client.on_close()
-        expiry = qmt._UNIVERSE_CLIENTS["first"]["expires_at"]
-        qmt._BACKFILL_PENDING.remove(("A.SH", "1m"))
-        qmt._BACKFILL_RUNNING.add(("A.SH", "1m"))
-        before = dict(qmt._UNIVERSE_CLIENTS["first"])
-        with patch.object(qmt, "_APP", object()), patch.object(qmt, "expire_universe_clients", side_effect=AssertionError), patch.object(qmt, "refresh_global_subscriptions", side_effect=AssertionError):
-            payload = self.health(now=1000)  # Even overdue grace is only observed, never mutated.
-        self.assertEqual(payload["clients"], [
-            {"client_id": "first", "addr": "10.0.0.1", "state": "grace", "expires_at": expiry},
-            {"client_id": "unconfigured", "addr": unconfigured.request.remote_ip, "state": "connected", "expires_at": None},
-        ])
-        self.assertEqual(qmt._UNIVERSE_CLIENTS["first"], before)
-        self.assertEqual(payload["universe_size"], 2)
-        self.assertEqual(payload["realtime"]["symbol_count"], 1)
-        self.assertEqual(payload["realtime"]["subscription_count"], 2)  # 1m + 5m native handles.
-        self.assertEqual(payload["backfill"], {"pending": 4, "running": 1})
-        self.assertIsNotNone(datetime.fromisoformat(expiry).utcoffset())
-        self.ctx.get_market_data_ex.assert_not_called()
-
-    def test_health_reconnect_discards_old_grace_address_and_expiry(self):
-        self.configure(self.client, {"A.SH": True})
-        self.client.on_close()
-        replacement = self.make_client("first")
-        replacement.request.remote_ip = "10.0.0.9"
-        self.configure(replacement, {"A.SH": True})
-        self.assertEqual(self.health()["clients"], [
-            {"client_id": "first", "addr": "10.0.0.9", "state": "connected", "expires_at": None},
-        ])
 
     def test_ioloop_lag_sample_uses_monotonic_and_retains_only_60_seconds(self):
         qmt._IOLOOP_LAST_TICK = 100
@@ -726,6 +258,7 @@ class UniverseProtocolTest(unittest.TestCase):
         self.assertEqual(len(qmt._IOLOOP_LAG_SAMPLES), 1)
         self.assertAlmostEqual(qmt._IOLOOP_LAG_SAMPLES[-1][1], 59100)
 
+
     def test_ioloop_lag_uses_actual_intervals_and_preserves_negative_observations(self):
         qmt._IOLOOP_LAST_TICK = 0
         with patch.object(qmt, "monotonic", side_effect=[1.2, 2.3, 5.8, 6.3]):
@@ -738,11 +271,13 @@ class UniverseProtocolTest(unittest.TestCase):
         self.assertAlmostEqual(lags[3], -500)
         self.assertEqual(qmt._IOLOOP_LAST_TICK, 6.3)
 
+
     def test_health_rolling_max_filters_old_samples_without_mutating_them(self):
         qmt._IOLOOP_LAG_SAMPLES.extend([(39, 9000), (40, 500), (99, 1)])
         self.assertEqual(self.health(now=100)["ioloop_lag_ms"], {"latest": 1, "max_60s": 500})
         self.assertEqual(self.health(now=160)["ioloop_lag_ms"], {"latest": 1, "max_60s": None})
         self.assertEqual(len(qmt._IOLOOP_LAG_SAMPLES), 3)
+
 
     def test_realtime_push_facts_deduplicate_periods_and_overlapping_clients(self):
         self.configure(self.client, {"A.SH": True, "B.SH": True, "C.SH": False})
@@ -764,6 +299,7 @@ class UniverseProtocolTest(unittest.TestCase):
         qmt.push_global_market_data()
         self.assertEqual(self.health()["realtime"], before)
 
+
     def test_no_realtime_push_facts_for_failed_empty_or_absent_delivery(self):
         self.configure(self.client, {"A.SH": True})
         self.client.send_json = Mock(return_value=False)
@@ -783,17 +319,6 @@ class UniverseProtocolTest(unittest.TestCase):
         self.assertIsNone(self.health()["realtime"]["last_push_at"])
         self.assertEqual(self.health()["realtime"]["pushed_symbol_count"], 0)
 
-    def test_websocket_send_reports_only_queued_writes(self):
-        client = qmt.MarketWebSocketHandler.__new__(qmt.MarketWebSocketHandler)
-        client.ws_connection = None
-        self.assertFalse(client.send_json({"type": "bar"}))
-        client.ws_connection = object()
-        future = Mock()
-        client.write_message = Mock(return_value=future)
-        self.assertTrue(client.send_json({"type": "bar"}))
-        future.add_done_callback.assert_called_once_with(client._consume_write_result)
-        client.write_message.side_effect = RuntimeError("closed")
-        self.assertFalse(client.send_json({"type": "bar"}))
 
     def test_health_sampler_stops_with_server(self):
         callbacks = [Mock() for _ in range(3)]
@@ -802,6 +327,7 @@ class UniverseProtocolTest(unittest.TestCase):
         for callback in callbacks:
             callback.stop.assert_called_once()
         loop.current.return_value.stop.assert_called_once()
+
 
     def test_health_sampler_lifecycle_on_loop_exit_start_failure_and_reinit(self):
         for failure in (None, RuntimeError("loop failed")):
@@ -814,7 +340,7 @@ class UniverseProtocolTest(unittest.TestCase):
                     callbacks.append(callback)
                     return callback
 
-                with patch.object(qmt, "_IOLOOP", None), patch.object(qmt, "_SERVER", None), patch.object(qmt, "_REALTIME_PUSHER", None), patch.object(qmt, "_ACCOUNT_PUSHER", None), patch.object(qmt, "_HEALTH_SAMPLER", old_sampler), patch.object(qmt, "IOLoop") as loop, patch.object(qmt, "HTTPServer"), patch.object(qmt, "start_backfill_worker"), patch.object(qmt, "PeriodicCallback", side_effect=periodic):
+                with patch.object(qmt, "_IOLOOP", None), patch.object(qmt, "_SERVER", None), patch.object(qmt, "_REALTIME_PUSHER", None), patch.object(qmt, "_ACCOUNT_PUSHER", None), patch.object(qmt, "_HEALTH_SAMPLER", old_sampler), patch.object(qmt, "IOLoop") as loop, patch.object(qmt, "HTTPServer"), patch.object(qmt, "start_download_worker"), patch.object(qmt, "PeriodicCallback", side_effect=periodic):
                     loop.return_value.start.side_effect = failure
                     qmt.init(Mock())
                     old_sampler.stop.assert_called_once()
@@ -827,20 +353,124 @@ class UniverseProtocolTest(unittest.TestCase):
                     self.assertIsNone(qmt._HEALTH_SAMPLER)
                     self.assertIsNone(qmt._IOLOOP)
 
+
     def test_health_sampler_stops_if_later_callback_start_fails(self):
         sampler, pusher = Mock(), Mock()
         pusher.start.side_effect = RuntimeError("callback start failed")
-        with patch.object(qmt, "_IOLOOP", None), patch.object(qmt, "_SERVER", None), patch.object(qmt, "_HEALTH_SAMPLER", None), patch.object(qmt, "_REALTIME_PUSHER", None), patch.object(qmt, "_ACCOUNT_PUSHER", None), patch.object(qmt, "IOLoop"), patch.object(qmt, "HTTPServer"), patch.object(qmt, "start_backfill_worker"), patch.object(qmt, "PeriodicCallback", side_effect=[sampler, pusher]):
+        with patch.object(qmt, "_IOLOOP", None), patch.object(qmt, "_SERVER", None), patch.object(qmt, "_HEALTH_SAMPLER", None), patch.object(qmt, "_REALTIME_PUSHER", None), patch.object(qmt, "_ACCOUNT_PUSHER", None), patch.object(qmt, "IOLoop"), patch.object(qmt, "HTTPServer"), patch.object(qmt, "start_download_worker"), patch.object(qmt, "PeriodicCallback", side_effect=[sampler, pusher]):
             qmt.init(Mock())
             sampler.stop.assert_called_once()
             pusher.stop.assert_called_once()
             self.assertIsNone(qmt._HEALTH_SAMPLER)
+
 
     def test_application_sends_websocket_pings(self):
         app = qmt.make_app()
         self.assertEqual(app.settings["websocket_ping_interval"], 30)
         self.assertEqual(app.settings["websocket_ping_timeout"], 30)
 
+    def download_body(self, client, symbols, period="1d", start="20260101000000", end="20260102150000"):
+        return {"client_id": client, "symbols": symbols, "period": period,
+                "start_time": start, "end_time": end}
 
-if __name__ == "__main__":
-    unittest.main()
+    def test_download_deduplicates_cross_clients_returns_correlated_status_and_lists(self):
+        handler_a = self.handler(qmt.DownloadHandler, self.download_body("a", ["600000.SH", "000001.SZ"]))
+        handler_a.get_argument = Mock(return_value="a")
+        handler_a.post()
+        payload_a = json.loads(handler_a.write.call_args.args[0])
+        handler_b = self.handler(qmt.DownloadHandler, self.download_body("b", ["000001.SZ", "600000.SH"]))
+        handler_b.set_status = Mock()
+        handler_b.post()
+        payload_b = json.loads(handler_b.write.call_args.args[0])
+        self.assertNotEqual(payload_a["id"], payload_b["id"])
+        self.assertIs(qmt._DOWNLOADS[payload_a["id"]]["jobs"][0], qmt._DOWNLOADS[payload_b["id"]]["jobs"][0])
+        self.assertEqual(payload_a["status"], "queued")
+        self.assertEqual(payload_a["client_id"], "a")
+        self.assertEqual(payload_a["progress"], {"total": 2, "completed": 0, "failed": 0})
+        listed = self.handler(qmt.DownloadHandler, {})
+        listed.get_argument = Mock(side_effect=lambda key, default="": "a" if key == "client_id" else "")
+        listed.get()
+        self.assertEqual(json.loads(listed.write.call_args.args[0])["requests"][0]["id"], payload_a["id"])
+
+    def test_download_queue_is_fair_and_one_native_typeerror_does_not_repeat(self):
+        def submit(client, symbols):
+            handler = self.handler(qmt.DownloadHandler, self.download_body(client, symbols))
+            handler.post()
+            return json.loads(handler.write.call_args.args[0])["id"]
+        aid = submit("A", ["600000.SH", "600001.SH", "600002.SH"])
+        bid = submit("B", ["000001.SZ"])
+        cid = submit("C", ["600000.SH", "600002.SH"])
+        events = []
+        def native(symbols, period, start, end, **kwargs):
+            self.assertFalse(kwargs["incrementally"])
+            events.append(symbols[0])
+            if symbols[0] == "600000.SH":
+                raise TypeError("inside native implementation")
+            return True
+        with patch.dict(qmt.__dict__, {"download_history_data2": native}), patch.object(qmt._DOWNLOAD_WAKE, "wait", side_effect=lambda timeout: qmt._DOWNLOAD_STOP.set()):
+            qmt.download_worker()
+        self.assertEqual(events, ["600000.SH", "000001.SZ", "600002.SH", "600001.SH"])
+        self.assertEqual(qmt._DOWNLOADS[aid]["status"], "failed")
+        self.assertIn("inside native implementation", qmt._DOWNLOADS[aid]["error"])
+        self.assertEqual(qmt._DOWNLOADS[bid]["status"], "success")
+        self.assertEqual(qmt._DOWNLOADS[cid]["status"], "failed")
+        self.assertTrue(qmt._DOWNLOADS[bid]["finished_at"])
+
+    def test_download_validation_and_history_download_are_strict(self):
+        for body in (
+                self.download_body("a", ["bad***"]),
+                self.download_body("a", ["600000.SH"], "x"),
+                self.download_body("a", ["600000.SH"], end="20991231150000")):
+            with self.assertRaises(qmt.HTTPError):
+                qmt.validate_download(body)
+        handler = self.handler(qmt.HistoryDataHandler, {"stock_code": "600000.SH", "download": True})
+        with self.assertRaises(qmt.HTTPError) as caught:
+            handler.post()
+        self.assertEqual(caught.exception.status_code, 400)
+        self.ctx.get_market_data_ex.assert_not_called()
+
+    def test_universe_rejects_invalid_and_duplicate_symbols_without_native_side_effect(self):
+        for rows in (
+            [{"symbol": "bad***", "subscribed": True}],
+            [{"symbol": "600000.SH", "subscribed": True}, {"symbol": "600000.SH", "subscribed": False}],
+        ):
+            with self.assertRaises(ValueError):
+                qmt.parse_universe(rows)
+        self.ctx.subscribe_quote.assert_not_called()
+
+    def test_broadcast_streams_isolation_and_bad_client_do_not_stop_delivery(self):
+        self.client.streams = {"order"}
+        self.client.send_json = Mock(side_effect=RuntimeError("closed"))
+        second = self.make_client("second")
+        second.streams = {"deal"}
+        second.send_json = Mock()
+        qmt._broadcast({"type": "order_update"}, "order")
+        self.assertEqual(second.send_json.call_count, 0)
+        qmt._broadcast({"type": "deal_update"}, "deal")
+        second.send_json.assert_called_once()
+        self.assertEqual(self.client.write_buffer_bytes, 0)
+
+    def test_readonly_market_data_ex_does_not_implicitly_subscribe(self):
+        handler = self.handler(qmt.MarketDataExHandler, {"fields": ["close"], "stock_code": ["600000.SH"]})
+        self.ctx.get_market_data_ex.return_value = {"600000.SH": {"close": 10}}
+        handler.post()
+        self.assertEqual(self.ctx.get_market_data_ex.call_args.args[-2:], (False, False))
+
+    def test_write_error_uses_tornado_log_message_without_exposing_server_errors(self):
+        handler = qmt.BaseHandler.__new__(qmt.BaseHandler)
+        handler._reason = "Bad Request"
+        handler.finish = Mock()
+        error = qmt.HTTPError(400, "specific detail")
+        handler.write_error(400, exc_info=(None, error, None))
+        self.assertEqual(json.loads(handler.finish.call_args.args[0])["error"], "specific detail")
+        handler.write_error(500, exc_info=(None, RuntimeError("secret"), None))
+        self.assertEqual(json.loads(handler.finish.call_args.args[0])["error"], "internal bridge error")
+
+    def test_input_numeric_and_list_validation_rejects_nan_and_wrong_types(self):
+        for value in (float("nan"), float("inf"), True, "oops"):
+            with self.assertRaises(qmt.HTTPError):
+                qmt.number(value, "price")
+        with self.assertRaises(qmt.HTTPError):
+            qmt.parse_list(["good", None])
+        with self.assertRaises(qmt.HTTPError):
+            qmt.validate_body({"client_id": "\ud800"})
