@@ -585,6 +585,22 @@ class UniverseProtocolTest(unittest.TestCase):
         handler.write_error(500, exc_info=(None, RuntimeError("secret"), None))
         self.assertEqual(json.loads(handler.finish.call_args.args[0])["error"], "internal bridge error")
 
+    def test_all_http_handlers_validate_nonempty_json_before_any_action(self):
+        for body in (b"[]", b"broken", b'{"value": NaN}'):
+            handler = self.handler(qmt.ShutdownHandler, {})
+            handler.request.body = body
+            with self.assertRaises(qmt.HTTPError) as caught:
+                handler.prepare()
+            self.assertEqual(caught.exception.status_code, 400)
+        handler = self.handler(qmt.SectorHandler, {"sector": "test", "realtime": "bad"})
+        with self.assertRaises(qmt.HTTPError) as caught:
+            handler.post()
+        self.assertEqual(caught.exception.status_code, 400)
+        self.ctx.get_sector.assert_not_called()
+        for key in ("orderId", "taskId"):
+            with self.assertRaises(qmt.HTTPError):
+                qmt.validate_body({key: {"bad": "identifier"}})
+
     def test_input_numeric_and_list_validation_rejects_nan_and_wrong_types(self):
         for value in (float("nan"), float("inf"), True, "oops"):
             with self.assertRaises(qmt.HTTPError):

@@ -146,6 +146,8 @@ def validate_body(data):
             raise HTTPError(400, "%s must be a string" % key)
         elif key == "userOrderParam" and not isinstance(value, dict):
             raise HTTPError(400, "userOrderParam must be an object")
+        elif key in ("orderId", "taskId") and (isinstance(value, bool) or not isinstance(value, (str, int))):
+            raise HTTPError(400, "%s must be a string or integer identifier" % key)
     pending = list(data.values())
     while pending:
         value = pending.pop()
@@ -570,6 +572,8 @@ class BaseHandler(RequestHandler):
             token = self.request.headers.get('X-Token')
             if token != TOKEN:
                 raise HTTPError(401, "认证失败：token 无效或缺失")
+        if getattr(self.request, "body", b""):
+            self.json_body()
 
     def set_default_headers(self):
         self.set_header("Content-Type", "application/json; charset=utf-8")
@@ -582,6 +586,8 @@ class BaseHandler(RequestHandler):
         self.finish(json.dumps({"error": error, "status_code": status_code}, ensure_ascii=False))
 
     def json_body(self):
+        if hasattr(self, "_parsed_json_body"):
+            return self._parsed_json_body
         raw = self.request.body or b"{}"
         if len(raw) > _MESSAGE_LIMIT:
             raise HTTPError(400, "JSON body exceeds size limit")
@@ -592,6 +598,7 @@ class BaseHandler(RequestHandler):
         if not isinstance(data, dict):
             raise HTTPError(400, "JSON body must be an object")
         validate_body(data)
+        self._parsed_json_body = data
         return data
 
     def ctx(self):
@@ -857,7 +864,7 @@ class SectorHandler(BaseHandler):
         realtime = data.get('realtime', '0')
         if not sector:
             raise HTTPError(400, "need args sector")
-        ret = safe_call(self.ctx().get_sector, sector, int(realtime) if realtime != '0' else 0)
+        ret = safe_call(self.ctx().get_sector, sector, integer(realtime, 'realtime'))
         self.write(json.dumps({"sector": sector, "stocks": ret or []}, ensure_ascii=False))
 
 # ContextInfo.get_industry() - 获取行业成份股
