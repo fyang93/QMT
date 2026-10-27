@@ -46,6 +46,9 @@ class UniverseProtocolTest(unittest.TestCase):
             getattr(qmt, name).clear()
         qmt._BACKFILL_PENDING.clear()
         qmt._BACKFILL_RUNNING.clear()
+        qmt._BACKFILL_REQUESTS.clear()
+        qmt._BACKFILL_REQUEST_QUEUE.clear()
+        qmt._BACKFILL_REQUEST_PAIRS.clear()
         qmt._HISTORY_MANIFESTS.clear()
         qmt._WS_CLIENTS.clear()
         qmt._HISTORY_SEQUENCE = 0
@@ -204,6 +207,160 @@ class UniverseProtocolTest(unittest.TestCase):
         self.assertEqual(qmt._BACKFILL_PENDING, {("A.SH", "1d"), ("A.SH", "5m")})
         for client in (self.client, second):
             self.assertEqual(client.sent[-1]["type"], "history_ready")
+
+    def request_body(self, **changes):
+        today = datetime.now(qmt._QMT_TIMEZONE).strftime("%Y%m%d")
+        return dict({"symbols": ["600000.SH"], "period": "5m",
+                     "start_time": today + "000000", "end_time": today + "000000"}, **changes)
+
+    def submit_request(self, **changes):
+        handler = qmt.BackfillRequestHandler.__new__(qmt.BackfillRequestHandler)
+        handler.json_body = lambda: self.request_body(**changes)
+        handler.set_status = Mock()
+        handler.write = Mock()
+        handler.post()
+        self.assertEqual(handler.set_status.call_args.args, (202,))
+        return json.loads(handler.write.call_args.args[0])
+
+    def poll_request(self, request_id):
+        handler = qmt.BackfillRequestHandler.__new__(qmt.BackfillRequestHandler)
+        handler.get_argument = lambda name, default: request_id
+        handler.write = Mock()
+        handler.get()
+        return json.loads(handler.write.call_args.args[0])
+
+    def test_backfill_request_validates_today_and_future_bounds(self):
+        now = datetime.fromisoformat("2026-10-26T10:00:00+08:00")
+        with patch.object(qmt, "datetime", wraps=datetime) as clock:
+            clock.now.return_value = now
+            request = self.request_body(symbols=["600000.sh", "000001.SZ", "920001.BJ", "600000.SH"],
+                                        start_time="20261026000000", end_time="20261026000000")
+            self.assertEqual(qmt.validate_backfill_request(request)[0], ["000001.SZ", "600000.SH", "920001.BJ"])
+            for changes in ({"symbols": []}, {"symbols": "600000.SH"}, {"symbols": [None]},
+                            {"symbols": ["A.SH"]}, {"symbols": ["000300.SH"]},
+                            {"symbols": ["510300.SH"]}, {"symbols": ["399001.SZ"]}, {"period": "1d"},
+                            {"start_time": "20261026"}, {"start_time": 20261026093000},
+                            {"start_time": "20261026096000"}, {"end_time": "20261026100001"},
+                            {"start_time": "20261025093000"}, {"end_time": "20261027000000"},
+                            {"start_time": "20261026093000", "end_time": "20261026090000"}):
+                with self.subTest(changes=changes), self.assertRaises(ValueError):
+                    qmt.validate_backfill_request(dict(request, **changes))
+            qmt.validate_backfill_request(dict(request, end_time="20261026100000"))
+
+    def test_backfill_request_routes_and_authentication(self):
+        with patch.object(qmt, "Application") as app:
+            qmt.make_app()
+        self.assertIn(("/api/data/backfill/request", qmt.BackfillRequestHandler), app.call_args.args[0])
+        handler = qmt.BackfillRequestHandler.__new__(qmt.BackfillRequestHandler)
+        for headers in ({}, {"X-Token": "wrong"}):
+            handler.request = types.SimpleNamespace(headers=headers)
+            with self.assertRaises(qmt.HTTPError) as error:
+                handler.prepare()
+            self.assertEqual(error.exception.args[0], 401)
+        handler.request = types.SimpleNamespace(headers={"X-Token": qmt.TOKEN})
+        handler.prepare()
+        with self.assertRaises(qmt.HTTPError) as error:
+            self.submit_request(period="1d")
+        self.assertEqual(error.exception.args[0], 400)
+        with self.assertRaises(qmt.HTTPError) as error:
+            self.poll_request("missing")
+        self.assertEqual(error.exception.args[0], 404)
+
+    def test_backfill_request_deduplicates_and_rejects_uncovered_active_ranges(self):
+        first = self.submit_request(symbols=["600000.SH", "000001.SZ"])
+        repeat = self.submit_request(symbols=["000001.sz", "600000.SH", "000001.SZ"])
+        self.assertEqual(first, repeat)
+        self.assertEqual(len(qmt._BACKFILL_REQUEST_QUEUE), 1)
+        for changes in ({"symbols": ["600000.SH"]}, {"start_time": self.request_body()["start_time"][:-2] + "01"}):
+            # A conflicting pair is not a successful new range or a second download.
+            if "start_time" in changes:
+                changes["end_time"] = changes["start_time"]
+            with self.assertRaises(qmt.HTTPError) as error:
+                self.submit_request(**changes)
+            self.assertEqual(error.exception.args[0], 409)
+        selected = qmt.take_backfill_request()
+        running = self.poll_request(first["id"])
+        self.assertEqual(running["status"], "running")
+        self.assertTrue(all(item["status"] == "running" for item in running["results"].values()))
+        self.assertEqual(self.submit_request(symbols=["600000.SH", "000001.SZ"]), running)
+        with patch.object(qmt, "download_history_range") as download:
+            qmt.run_backfill_request(*selected)
+        download.assert_called_once_with(first["symbols"], "5m", first["start_time"], first["end_time"])
+        result = self.poll_request(first["id"])
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(all(item == {"status": "success", "error": None} for item in result["results"].values()))
+        self.assertFalse(qmt._BACKFILL_REQUEST_PAIRS)
+        self.assertFalse(qmt._BACKFILL_RUNNING)
+        self.assertNotEqual(self.submit_request()["id"], first["id"])
+
+    def test_backfill_request_shares_reservations_without_consuming_archive_work(self):
+        self.configure(self.client, {"600000.SH": True})
+        self.submit_request(period="1m")
+        with patch.object(qmt, "trading_hours", return_value=True):
+            self.assertEqual(qmt.take_backfill_batch(), [])
+        with patch.object(qmt, "download_history_range") as downloader:
+            with self.assertRaises(qmt.HTTPError):
+                qmt.download_history_page(["600000.SH"], "1m", "20260101000000", "20260101100000")
+        downloader.assert_not_called()
+        selected = qmt.take_backfill_request()
+        with patch.object(qmt, "download_history_range"):
+            qmt.run_backfill_request(*selected)
+        self.assertEqual(qmt._BACKFILL_PENDING, {("600000.SH", "1m"), ("600000.SH", "5m"), ("600000.SH", "1d")})
+        qmt._BACKFILL_RUNNING.add(("600000.SH", "5m"))
+        with self.assertRaises(qmt.HTTPError) as error:
+            self.submit_request()
+        self.assertEqual(error.exception.args[0], 409)
+
+    def test_backfill_request_limit_is_global_active_requests_not_archive_pairs(self):
+        self.configure(self.client, {"S%d.SH" % i: False for i in range(100)})
+        for index in range(50):
+            self.submit_request(symbols=["%06d.SH" % (600000 + index)])
+        self.assertEqual(len(qmt._BACKFILL_REQUESTS), 50)
+        with self.assertRaises(qmt.HTTPError) as error:
+            self.submit_request(symbols=["600999.SH"])
+        self.assertEqual(error.exception.args[0], 429)
+        selected = qmt.take_backfill_request()
+        with self.assertRaises(qmt.HTTPError) as error:
+            self.submit_request(symbols=["600999.SH"])
+        self.assertEqual(error.exception.args[0], 429)  # Running requests still occupy capacity.
+        with patch.object(qmt, "download_history_range"):
+            qmt.run_backfill_request(*selected)
+        self.assertEqual(self.submit_request(symbols=["600999.SH"])["status"], "queued")
+        self.assertEqual(len(qmt._BACKFILL_PENDING), 200)
+
+    def test_backfill_request_downloads_any_symbol_count_on_worker_and_never_broadcasts(self):
+        symbols = ["%06d.SH" % (600000 + index) for index in range(101)]
+        payload = self.submit_request(symbols=symbols)
+        qmt._BACKFILL_PENDING.add(("UNIVERSE.SH", "1m"))
+
+        def download(stocks, period, start, end):
+            self.assertEqual(stocks, symbols)
+            self.assertEqual(self.poll_request(payload["id"])["status"], "running")
+            qmt._BACKFILL_STOP.set()
+
+        with patch.object(qmt, "trading_hours", return_value=True), patch.object(qmt, "schedule_incremental_backfill"), patch.object(qmt, "download_history_range", side_effect=download) as downloader, patch.object(qmt, "take_backfill_batch") as archive, patch.object(qmt, "_queue_broadcast") as broadcast:
+            qmt.backfill_worker()
+        downloader.assert_called_once()
+        archive.assert_not_called()
+        broadcast.assert_not_called()
+        self.assertFalse(qmt._UNIVERSE_SUBSCRIBED)
+        self.assertFalse(qmt._BACKFILL_RESULTS)  # A small directed range never claims archive coverage.
+        self.assertFalse(qmt._HISTORY_MANIFESTS)
+        self.assertEqual(qmt._BACKFILL_PENDING, {("UNIVERSE.SH", "1m")})
+        self.ctx.get_market_data_ex.assert_not_called()
+        self.assertEqual(self.poll_request(payload["id"])["status"], "success")
+
+    def test_backfill_request_reports_failure_and_releases_reservations(self):
+        payload = self.submit_request(symbols=["600000.SH", "000001.SZ"])
+        selected = qmt.take_backfill_request()
+        with patch.object(qmt, "download_history_range", side_effect=RuntimeError("native failure")):
+            qmt.run_backfill_request(*selected)
+        failed = self.poll_request(payload["id"])
+        self.assertEqual(failed["status"], "failed")
+        self.assertTrue(all(item == {"status": "failed", "error": "native failure"} for item in failed["results"].values()))
+        self.assertFalse(qmt._BACKFILL_REQUEST_PAIRS)
+        self.assertFalse(qmt._BACKFILL_RUNNING)
+        self.assertEqual(self.submit_request()["status"], "queued")
 
     def test_trading_hours_include_beijing_weekday_boundaries(self):
         for text, expected in (("2026-10-26T09:14:59+08:00", False), ("2026-10-26T01:15:00+00:00", True),

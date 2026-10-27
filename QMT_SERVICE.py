@@ -40,7 +40,11 @@ _WS_CLIENTS = set()
 _BACKFILL_PENDING = set()
 _BACKFILL_RESULTS = {}
 _BACKFILL_RUNNING = set()
+_BACKFILL_REQUESTS = {}
+_BACKFILL_REQUEST_QUEUE = deque()
+_BACKFILL_REQUEST_PAIRS = set()
 _BACKFILL_LOCK = Lock()
+_BACKFILL_REQUEST_LIMIT = 50
 _BACKFILL_STOP = Event()
 _BACKFILL_THREAD = None
 _BACKFILL_NEXT_INCREMENTAL = 0.0
@@ -496,7 +500,7 @@ def take_backfill_batch():
             if item[0] in _UNIVERSE_SUBSCRIBED and (item[1] != "1m" or _UNIVERSE_SUBSCRIBED[item[0]])
         })
         intraday = trading_hours()
-        eligible = [item for item in _BACKFILL_PENDING - _BACKFILL_RUNNING if not intraday or item[1] == "1m"]
+        eligible = [item for item in _BACKFILL_PENDING - _BACKFILL_RUNNING - _BACKFILL_REQUEST_PAIRS if not intraday or item[1] == "1m"]
         if not eligible:
             return []
         eligible.sort(key=lambda item: ({"1d": 0, "1m": 1, "5m": 2}[item[1]], not _UNIVERSE_SUBSCRIBED[item[0]], item[0]))
@@ -508,9 +512,47 @@ def take_backfill_batch():
         return batch
 
 
+def take_backfill_request():
+    with _BACKFILL_LOCK:
+        while _BACKFILL_REQUEST_QUEUE:
+            request_id = _BACKFILL_REQUEST_QUEUE.popleft()
+            request = _BACKFILL_REQUESTS.get(request_id)
+            if request and request["status"] == "queued":
+                _BACKFILL_RUNNING.update((symbol, request["period"]) for symbol in request["symbols"])
+                request["status"] = "running"
+                for result in request["results"].values():
+                    result["status"] = "running"
+                return request_id, request
+    return None
+
+
+def run_backfill_request(request_id, request):
+    try:
+        download_history_range(request["symbols"], request["period"], request["start_time"], request["end_time"])
+        with _BACKFILL_LOCK:
+            for result in request["results"].values():
+                result.update(status="success", error=None)
+            request["status"] = "success"
+    except Exception as exc:
+        logger.exception("QMT requested backfill failed: id=%s", request_id)
+        with _BACKFILL_LOCK:
+            for result in request["results"].values():
+                result.update(status="failed", error=str(exc))
+            request["status"] = "failed"
+    finally:
+        with _BACKFILL_LOCK:
+            pairs = {(symbol, request["period"]) for symbol in request["symbols"]}
+            _BACKFILL_RUNNING.difference_update(pairs)
+            _BACKFILL_REQUEST_PAIRS.difference_update(pairs)
+
+
 def backfill_worker():
     while not _BACKFILL_STOP.is_set():
         schedule_incremental_backfill()
+        request = take_backfill_request()
+        if request is not None:
+            run_backfill_request(*request)
+            continue
         batch = take_backfill_batch()
         if not batch:
             _BACKFILL_STOP.wait(0.5)
@@ -1048,8 +1090,8 @@ def download_history_page(stocks, period, start_time, end_time):
             and _BACKFILL_RESULTS[stock + ":" + period]["end_time"] >= end_time
         )]
         batch = {(stock, period) for stock in needed}
-        if batch & _BACKFILL_RUNNING:
-            raise HTTPError(503, "history download already running; retry local reads later")
+        if batch & (_BACKFILL_RUNNING | _BACKFILL_REQUEST_PAIRS):
+            raise HTTPError(503, "history download already queued or running; retry local reads later")
         _BACKFILL_RUNNING.update(batch)
         _BACKFILL_PENDING.difference_update(batch)
         previous = [_BACKFILL_RESULTS.get(stock + ":" + period) or {} for stock in needed]
@@ -1171,6 +1213,83 @@ class BackfillTargetsHandler(BaseHandler):
             "symbols": len(parse_list(stocks)),
             "queued": queued,
         }, ensure_ascii=False))
+
+
+def validate_backfill_request(data):
+    symbols = data.get("symbols")
+    if not isinstance(symbols, list) or not symbols:
+        raise ValueError("symbols must be a non-empty list of CN stock codes")
+    stock_pattern = r"(?:(?:60|68)[0-9]{4}\.SH|(?:00|30)[0-9]{4}\.SZ|(?:[48][0-9]{5}|92[0-9]{4})\.BJ)"
+    if any(not isinstance(symbol, str) or not re.fullmatch(stock_pattern, symbol.upper()) for symbol in symbols):
+        raise ValueError("symbols must be CN stock codes such as 600000.SH")
+    symbols = sorted(set(symbol.upper() for symbol in symbols))
+    period = data.get("period")
+    if period not in ("1m", "5m"):
+        raise ValueError("period must be 1m or 5m")
+    start_time, end_time = data.get("start_time"), data.get("end_time")
+    try:
+        if not isinstance(start_time, str) or not re.fullmatch(r"[0-9]{14}", start_time):
+            raise ValueError
+        if not isinstance(end_time, str) or not re.fullmatch(r"[0-9]{14}", end_time):
+            raise ValueError
+        start = datetime.strptime(start_time, "%Y%m%d%H%M%S")
+        end = datetime.strptime(end_time, "%Y%m%d%H%M%S")
+    except ValueError:
+        raise ValueError("start_time and end_time must be valid YYYYMMDDHHMMSS timestamps")
+    now = datetime.now(_QMT_TIMEZONE)
+    today = now.strftime("%Y%m%d")
+    if start.strftime("%Y%m%d") != today or end.strftime("%Y%m%d") != today or end < start:
+        raise ValueError("start_time and end_time must be an ordered range on Beijing today")
+    if end > now.replace(tzinfo=None):
+        raise ValueError("end_time must not be in the future")
+    return symbols, period, start_time, end_time
+
+
+def backfill_request_payload(request_id, request):
+    return {"id": request_id, "status": request["status"], "symbols": request["symbols"],
+            "period": request["period"], "start_time": request["start_time"],
+            "end_time": request["end_time"], "results": request["results"]}
+
+
+class BackfillRequestHandler(BaseHandler):
+    def post(self):
+        try:
+            symbols, period, start_time, end_time = validate_backfill_request(self.json_body())
+        except ValueError as exc:
+            raise HTTPError(400, str(exc))
+        with _BACKFILL_LOCK:
+            for request_id, request in _BACKFILL_REQUESTS.items():
+                if (request["status"] in ("queued", "running") and request["symbols"] == symbols
+                        and request["period"] == period and request["start_time"] == start_time
+                        and request["end_time"] == end_time):
+                    self.set_status(202)
+                    self.write(json.dumps(backfill_request_payload(request_id, request), ensure_ascii=False))
+                    return
+            pairs = {(symbol, period) for symbol in symbols}
+            if pairs & (_BACKFILL_RUNNING | _BACKFILL_REQUEST_PAIRS):
+                raise HTTPError(409, "symbol/period already queued or running for another request; retry after completion")
+            active = sum(request["status"] in ("queued", "running") for request in _BACKFILL_REQUESTS.values())
+            if active >= _BACKFILL_REQUEST_LIMIT:
+                raise HTTPError(429, "backfill request queue is full")
+            request_id = uuid4().hex
+            request = {"status": "queued", "symbols": symbols, "period": period,
+                       "start_time": start_time, "end_time": end_time,
+                       "results": {symbol: {"status": "queued", "error": None} for symbol in symbols}}
+            _BACKFILL_REQUESTS[request_id] = request
+            _BACKFILL_REQUEST_QUEUE.append(request_id)
+            _BACKFILL_REQUEST_PAIRS.update(pairs)
+            payload = json.dumps(backfill_request_payload(request_id, request), ensure_ascii=False)
+        self.set_status(202)
+        self.write(payload)
+
+    def get(self):
+        request_id = self.get_argument("id", "")
+        with _BACKFILL_LOCK:
+            request = _BACKFILL_REQUESTS.get(request_id)
+            if request is None:
+                raise HTTPError(404, "backfill request not found")
+            payload = json.dumps(backfill_request_payload(request_id, request), ensure_ascii=False)
+        self.write(payload)
 
 
 class BackfillStatusHandler(BaseHandler):
@@ -2358,6 +2477,7 @@ def make_app():
         (r"/api/data/risk_free_rate", RiskFreeRateHandler),
         (r"/api/data/date_location", DateLocationHandler),
         (r"/api/data/history_data", HistoryDataHandler),
+        (r"/api/data/backfill/request", BackfillRequestHandler),
         (r"/api/data/backfill/targets", BackfillTargetsHandler),
         (r"/api/data/backfill/status", BackfillStatusHandler),
         (r"/api/data/market_data", MarketDataHandler),
